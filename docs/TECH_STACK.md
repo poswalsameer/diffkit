@@ -17,9 +17,12 @@
 - **Git 2.45+** is needed for the partial-clone no-fetch guard
   (`GIT_NO_LAZY_FETCH`). Older versions ignore the variable, so a partial
   clone *could* lazily fetch a missing blob during `git status`.
-- `--ahead-behind` (Git 2.17+) and porcelain v2 (Git 2.11+) are covered by
-  the 2.31 minimum.
+- `--ahead-behind` (Git 2.17+), porcelain v2 (Git 2.11+),
+  `--show-object-format` (Git 2.25+), and `--diff-algorithm=histogram` are
+  covered by the 2.31 minimum.
+- The diff engine (Phase 2) adds no dependency: the unified diff parser and
+  Myers alignment are implemented in `src/diff/` with the standard library.
 
 ## Approved dependencies
 
-None. No dependency was added in Phase 1.
+None. No dependency was added in Phase 1 or Phase 2.

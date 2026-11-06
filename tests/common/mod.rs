@@ -301,3 +301,86 @@ pub fn stdout(o: &Output) -> String {
 pub fn stderr(o: &Output) -> String {
     String::from_utf8_lossy(&o.stderr).into_owned()
 }
+
+// ---------------------------------------------------------------- diff helpers
+
+use diffkit::diff::{
+    DiffComparison, DiffEngine, DiffFile, DiffFileList, DiffOptions, DiffRowKind, FileDiff,
+};
+
+pub fn engine(path: &Path) -> DiffEngine {
+    engine_with(path, DiffOptions::default())
+}
+
+pub fn engine_with(path: &Path, options: DiffOptions) -> DiffEngine {
+    isolate();
+    DiffEngine::open(path, options).unwrap_or_else(|e| panic!("open {}: {e}", path.display()))
+}
+
+pub fn discover(engine: &DiffEngine, c: DiffComparison) -> DiffFileList {
+    engine
+        .discover(c)
+        .unwrap_or_else(|e| panic!("discover {c:?}: {e}"))
+}
+
+/// The entry whose new path (or old path, for deletions) is `path`.
+pub fn entry(list: &DiffFileList, path: impl AsRef<Path>) -> &DiffFile {
+    let path = path.as_ref();
+    list.files
+        .iter()
+        .find(|f| f.path() == path)
+        .unwrap_or_else(|| {
+            panic!(
+                "{} not in {:?}: {:#?}",
+                path.display(),
+                list.comparison,
+                list.files
+            )
+        })
+}
+
+/// Discovers `c` and loads the diff of `path`.
+pub fn load(engine: &DiffEngine, c: DiffComparison, path: impl AsRef<Path>) -> FileDiff {
+    let list = discover(engine, c);
+    let id = entry(&list, path).id;
+    engine
+        .load_file_diff(&list, id)
+        .unwrap_or_else(|e| panic!("load: {e}"))
+}
+
+/// (kind, old line number, new line number, old text, new text)
+pub type RowSummary = (DiffRowKind, Option<usize>, Option<usize>, String, String);
+
+pub fn rows(d: &FileDiff) -> Vec<RowSummary> {
+    let text = |l: &Option<diffkit::diff::DiffLine>| {
+        l.as_ref()
+            .map(|l| String::from_utf8_lossy(&l.content).into_owned())
+            .unwrap_or_default()
+    };
+    d.rows()
+        .map(|r| {
+            (
+                r.kind,
+                r.old_line.as_ref().map(|l| l.line_number),
+                r.new_line.as_ref().map(|l| l.line_number),
+                text(&r.old_line),
+                text(&r.new_line),
+            )
+        })
+        .collect()
+}
+
+pub fn row(
+    kind: DiffRowKind,
+    old: Option<usize>,
+    new: Option<usize>,
+    old_text: &str,
+    new_text: &str,
+) -> RowSummary {
+    (kind, old, new, old_text.into(), new_text.into())
+}
+
+/// Numbered lines "prefix1\n…prefixN\n".
+pub fn numbered(prefix: &str, n: usize) -> String {
+    (1..=n).map(|i| format!("{prefix}{i}\n")).collect()
+}

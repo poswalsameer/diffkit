@@ -24,11 +24,35 @@ impl ObjectId {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// The all-zero ID Git prints for "no object" or "not hashed".
+    pub fn is_zero(&self) -> bool {
+        self.0.bytes().all(|b| b == b'0')
+    }
 }
 
 impl fmt::Display for ObjectId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
+    }
+}
+
+/// Hash algorithm of the repository's object database.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObjectFormat {
+    Sha1,
+    Sha256,
+}
+
+impl ObjectFormat {
+    /// The empty tree, which Git knows without it being stored. Used as the
+    /// base of comparisons when HEAD is unborn.
+    pub fn empty_tree(self) -> ObjectId {
+        let hex: &[u8] = match self {
+            Self::Sha1 => b"4b825dc642cb6eb9a060e54bf8d69288fbee4904",
+            Self::Sha256 => b"6ef19b41225c5369f1c104d45d8d85efa9b057b53b14b4b9b939dd74decc5321",
+        };
+        ObjectId::parse(hex).expect("valid constant")
     }
 }
 
@@ -56,6 +80,7 @@ pub struct RepositoryInfo {
     /// History is truncated (`git clone --depth`); commit counts are limited
     /// to the locally available history.
     pub shallow: bool,
+    pub object_format: ObjectFormat,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

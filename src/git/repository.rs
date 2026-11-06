@@ -1,14 +1,15 @@
 //! Repository discovery: root, Git directory, common directory, worktree
-//! kind, and shallowness, all resolved by Git itself.
+//! kind, shallowness, and object format, all resolved by Git itself.
 
 use super::{
     commands,
     errors::{GitError, Result},
-    models::{RepositoryInfo, RepositoryKind},
+    models::{ObjectFormat, RepositoryInfo, RepositoryKind},
 };
 use std::path::{Path, PathBuf};
 
-/// Flags whose answers are `true`/`false`, then the three path queries.
+/// Flags whose answers are `true`/`false`, the object format, then the
+/// three path queries.
 /// `--show-toplevel` is last: outside a working tree it is the one that
 /// fails, and the answers printed before it are still readable.
 const FLAGS: [&str; 3] = [
@@ -16,6 +17,9 @@ const FLAGS: [&str; 3] = [
     "--is-bare-repository",
     "--is-shallow-repository",
 ];
+const FORMAT: &str = "--show-object-format";
+/// Lines before the path answers: the flags plus the object format.
+const PREFIX_LINES: usize = FLAGS.len() + 1;
 const PATHS: [&str; 3] = ["--absolute-git-dir", "--git-common-dir", "--show-toplevel"];
 
 pub fn discover() -> Result<RepositoryInfo> {
@@ -52,6 +56,7 @@ pub fn discover_from(start: &Path) -> Result<RepositoryInfo> {
     })?;
     let mut args = vec!["rev-parse", "--path-format=absolute"];
     args.extend(FLAGS);
+    args.push(FORMAT);
     args.extend(PATHS);
     let out = commands::output(&cwd, &args)?;
     let lines: Vec<&[u8]> = commands::strip_newline(&out.stdout)
@@ -74,10 +79,20 @@ pub fn discover_from(start: &Path) -> Result<RepositoryInfo> {
     if !inside || bare {
         return Err(GitError::NotAWorkTree { path: cwd });
     }
+    let object_format = match lines.get(FLAGS.len()).copied() {
+        Some(b"sha1") => ObjectFormat::Sha1,
+        Some(b"sha256") => ObjectFormat::Sha256,
+        other => {
+            return Err(GitError::malformed(
+                "rev-parse",
+                format!("unknown object format {other:?}"),
+            ))
+        }
+    };
     // rev-parse cannot NUL-terminate, so a path containing a newline makes
     // the combined answer ambiguous. Fall back to one query per path.
-    let paths = if lines.len() == FLAGS.len() + PATHS.len() {
-        lines[FLAGS.len()..]
+    let paths = if lines.len() == PREFIX_LINES + PATHS.len() {
+        lines[PREFIX_LINES..]
             .iter()
             .map(|l| absolute(&cwd, l))
             .collect::<Result<Vec<_>>>()?
@@ -106,6 +121,7 @@ pub fn discover_from(start: &Path) -> Result<RepositoryInfo> {
         kind,
         is_inside_work_tree: inside,
         shallow,
+        object_format,
     })
 }
 

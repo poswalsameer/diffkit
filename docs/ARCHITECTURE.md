@@ -1,16 +1,17 @@
 # Architecture
 
-Diffkit is a library crate (`src/lib.rs`, module `git`) plus a binary
-(`src/main.rs`, module `app`). The library owns everything about Git; the
-binary owns argument handling and presentation.
+Diffkit is a library crate (`src/lib.rs`, modules `git` and `diff`) plus a
+binary (`src/main.rs`, module `app`). The library owns everything about Git;
+the binary owns argument handling and presentation.
 
 ```text
 src/
   main.rs            entry point: passes argv to app::cli and exits with its code
-  lib.rs             exposes the `git` module to the binary, tests, and later phases
+  lib.rs             exposes `git` and `diff` to the binary, tests, and later phases
   app/
     cli.rs           argument parsing, dispatch, stdout/stderr, exit codes
     report.rs        formats a RepositorySnapshot as the text report
+    diff_stats.rs    `diffkit diff-stats [--load]` diagnostic (Phase 2)
   git/
     commands.rs      the only place a process is started
     errors.rs        GitError and Result
@@ -20,6 +21,17 @@ src/
     branches.rs      branch, HEAD, and upstream resolution
     commits.rs       ahead/behind tracking
     snapshot.rs      assembles one RepositorySnapshot
+  diff/              Phase 2 diff engine
+    engine.rs        DiffEngine: discover / load_file_diff / load_all, staleness checks
+    commands.rs      argument arrays for diff-index, diff-files, ls-files, cat-file
+    discovery.rs     --raw --numstat -z parsing and DiffFile construction
+    parser.rs        byte-oriented unified diff parser
+    hunk.rs          line numbering, line endings, hunk validation, untracked hunks
+    alignment.rs     Myers (linear space, bounded) + line pairing → AlignedRow
+    binary.rs        binary heuristic for untracked files, blob sizes
+    untracked.rs     safe discovery and reading of untracked files
+    models.rs        diff data model
+    errors.rs        DiffError
 ```
 
 ## Layers and responsibilities
@@ -78,3 +90,28 @@ them through `RepositorySnapshot`; integration tests assert on them
 directly; later phases can call `git::snapshot::inspect` or the individual
 layers. Missing information is represented by `Option` or a dedicated enum
 variant, so callers cannot mistake "unavailable" for "zero".
+
+## Phase 2: diff engine
+
+```text
+DiffEngine::from_snapshot(&snapshot)       HEAD, object format, conflicted paths (no Git call)
+  discover(Staged|Unstaged|Combined)      git diff-index [--cached] <base> | git diff-files
+                                           --raw --numstat -z → discovery::parse_raw_numstat
+                                           → DiffFile list (+ lstat stamps for working-tree sides)
+  discover(Untracked)                     git ls-files --others --exclude-standard -z (+ lstat)
+  load_file_diff(list, id)                git diff-index/diff-files -p … -- <path(s)>   (bounded output)
+                                           → parser::parse_patch → select section by paths
+                                           → staleness checks → hunk::build_hunks
+                                           → alignment::align per change block → FileDiff
+                                           untracked: read file directly (no Git call)
+  load_all(list)                          one patch command for the comparison, sections → files
+```
+
+`diff` depends on `git` (command layer, path conversion, models, snapshot);
+`git` does not depend on `diff`. Parsing, numbering and alignment are pure
+functions with no I/O, so they are unit-tested with byte fixtures. Only
+`engine`, `discovery`, `binary`, and `untracked` touch Git or the file system.
+
+The engine uses the plumbing commands `diff-index`/`diff-files` because
+porcelain `git diff` rewrites `.git/index` after working-tree comparisons
+even with `GIT_OPTIONAL_LOCKS=0` (see `docs/phases/PHASE_2_DIFF_ENGINE.md`).

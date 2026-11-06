@@ -7,8 +7,12 @@ pull, fetch, reset, restore, check out, switch, merge, rebase, cherry-pick,
 modify remotes or upstream configuration, edit `.git/config`, write refs or
 tags, create or delete branches, or intentionally modify `.git/index`.
 
-The application runs exactly three Git subcommands: `rev-parse`, `status`,
-and `for-each-ref`. Every invocation sets:
+`diffkit inspect` runs exactly three Git subcommands: `rev-parse`, `status`,
+and `for-each-ref`. The Phase 2 diff engine adds four read-only ones:
+`diff-index`, `diff-files`, `ls-files`, and `cat-file`. Porcelain `git diff`
+is deliberately not used, because it rewrites `.git/index` after
+working-tree comparisons even with `GIT_OPTIONAL_LOCKS=0`. Every invocation
+sets:
 
 - `GIT_OPTIONAL_LOCKS=0` — `git status` would otherwise take the index lock
   and write back refreshed stat information. Tests prove that plain
@@ -17,9 +21,17 @@ and `for-each-ref`. Every invocation sets:
   blobs from the promisor remote during rename detection. With this
   variable Git refuses instead, and Diffkit reports Git's error. This needs
   Git 2.45+.
+- `GIT_LITERAL_PATHSPECS=1`, with `GIT_GLOB_PATHSPECS`,
+  `GIT_NOGLOB_PATHSPECS`, `GIT_ICASE_PATHSPECS`, and `GIT_DIFF_OPTS`
+  removed. Filenames passed after `--` are always literal paths.
 
-Adding any other Git subcommand requires review, and the allow-list in
-`tests/read_only.rs` must be updated deliberately.
+Diff commands also pass `--no-ext-diff --no-textconv --no-color`, so
+configured external diff programs and textconv filters never run
+(`tests/diff_read_only.rs` proves it with a positive control).
+
+Adding any other Git subcommand requires review, and the allow-lists in
+`tests/read_only.rs` and `tests/diff_read_only.rs` must be updated
+deliberately.
 
 ## Git CLI is the source of truth
 

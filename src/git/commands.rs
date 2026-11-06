@@ -2,22 +2,39 @@
 //!
 //! Every invocation runs the `git` executable directly (never a shell),
 //! passes arguments as discrete `OsStr` values, pins the target directory
-//! with `-C`, and closes stdin. Two environment variables enforce the
+//! with `-C`, and closes stdin. Environment variables enforce the
 //! read-only, offline contract without touching the user's configuration:
-//! `GIT_OPTIONAL_LOCKS=0` stops `git status` from taking optional locks and
-//! writing opportunistic index refreshes, and `GIT_NO_LAZY_FETCH=1` stops a
-//! partial clone from fetching missing objects from its promisor remote
-//! (honored by Git 2.45 and later).
+//!
+//! - `GIT_OPTIONAL_LOCKS=0` stops `git status`/`git diff` from taking
+//!   optional locks and writing opportunistic index refreshes.
+//! - `GIT_NO_LAZY_FETCH=1` stops a partial clone from fetching missing
+//!   objects from its promisor remote (honored by Git 2.45 and later).
+//! - `GIT_LITERAL_PATHSPECS=1` (with the glob/icase variants removed) makes
+//!   every pathspec a literal path, so filenames are never patterns.
+//! - `GIT_DIFF_OPTS` is removed so it cannot override the context size
+//!   Diffkit requests explicitly.
 
 use super::errors::{GitError, Result};
 use std::{
+    borrow::Cow,
+    cell::Cell,
     ffi::OsStr,
-    io,
+    io::{self, Read},
     path::{Path, PathBuf},
     process::{Command, ExitStatus, Stdio},
 };
 
 const GIT: &str = "git";
+
+thread_local! {
+    static INVOCATIONS: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Number of Git processes started by the current thread. Used by tests and
+/// benchmarks to verify that no redundant subprocesses are spawned.
+pub fn thread_invocations() -> u64 {
+    INVOCATIONS.with(Cell::get)
+}
 
 /// Raw result of a Git process whose exit status the caller interprets.
 pub struct GitOutput {
@@ -26,27 +43,97 @@ pub struct GitOutput {
     pub stderr: Vec<u8>,
 }
 
-/// Runs `git -C <dir> <args...>` and returns its output regardless of exit
-/// status. Fails only if the process could not be run at all.
-pub fn output<S: AsRef<OsStr>>(dir: &Path, args: &[S]) -> Result<GitOutput> {
-    let out = Command::new(GIT)
-        .arg("-C")
+/// Result of [`output_limited`].
+pub enum LimitedOutput {
+    Complete(GitOutput),
+    /// Standard output exceeded the limit; the process was killed and the
+    /// partial output discarded.
+    Exceeded {
+        limit: u64,
+    },
+}
+
+fn command<S: AsRef<OsStr>>(dir: &Path, args: &[S]) -> Command {
+    INVOCATIONS.with(|n| n.set(n.get() + 1));
+    let mut c = Command::new(GIT);
+    c.arg("-C")
         .arg(dir)
         .args(args)
         .env("GIT_OPTIONAL_LOCKS", "0")
         .env("GIT_NO_LAZY_FETCH", "1")
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|e| match e.kind() {
-            io::ErrorKind::NotFound => GitError::GitNotFound,
-            io::ErrorKind::PermissionDenied => GitError::GitNotExecutable(e),
-            _ => GitError::Io(e),
-        })?;
+        .env("GIT_LITERAL_PATHSPECS", "1")
+        .env_remove("GIT_GLOB_PATHSPECS")
+        .env_remove("GIT_NOGLOB_PATHSPECS")
+        .env_remove("GIT_ICASE_PATHSPECS")
+        .env_remove("GIT_DIFF_OPTS")
+        .stdin(Stdio::null());
+    c
+}
+
+fn spawn_error(e: io::Error) -> GitError {
+    match e.kind() {
+        io::ErrorKind::NotFound => GitError::GitNotFound,
+        io::ErrorKind::PermissionDenied => GitError::GitNotExecutable(e),
+        _ => GitError::Io(e),
+    }
+}
+
+/// Runs `git -C <dir> <args...>` and returns its output regardless of exit
+/// status. Fails only if the process could not be run at all.
+pub fn output<S: AsRef<OsStr>>(dir: &Path, args: &[S]) -> Result<GitOutput> {
+    let out = command(dir, args).output().map_err(spawn_error)?;
     Ok(GitOutput {
         status: out.status,
         stdout: out.stdout,
         stderr: out.stderr,
     })
+}
+
+/// Like [`output`], but stops reading once stdout exceeds `limit` bytes,
+/// kills Git, and reports [`LimitedOutput::Exceeded`] instead of returning
+/// a truncated result. Stderr is drained on a scoped thread that is joined
+/// before returning, so a chatty stderr cannot block the process.
+pub fn output_limited<S: AsRef<OsStr>>(
+    dir: &Path,
+    args: &[S],
+    limit: u64,
+) -> Result<LimitedOutput> {
+    let mut child = command(dir, args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(spawn_error)?;
+    let mut stdout_pipe = child.stdout.take().expect("piped stdout");
+    let mut stderr_pipe = child.stderr.take().expect("piped stderr");
+    let (read, stderr) = std::thread::scope(|scope| {
+        let errs = scope.spawn(move || {
+            let mut buf = Vec::new();
+            let _ = stderr_pipe.read_to_end(&mut buf);
+            buf
+        });
+        let mut stdout = Vec::new();
+        // Read one byte past the limit to detect overflow.
+        let read = (&mut stdout_pipe)
+            .take(limit.saturating_add(1))
+            .read_to_end(&mut stdout)
+            .map(|_| stdout);
+        let exceeded = matches!(&read, Ok(b) if b.len() as u64 > limit);
+        if exceeded {
+            let _ = child.kill();
+        }
+        drop(stdout_pipe);
+        (read, errs.join().unwrap_or_default())
+    });
+    let status = child.wait().map_err(GitError::Io)?;
+    let stdout = read.map_err(GitError::Io)?;
+    if stdout.len() as u64 > limit {
+        return Ok(LimitedOutput::Exceeded { limit });
+    }
+    Ok(LimitedOutput::Complete(GitOutput {
+        status,
+        stdout,
+        stderr,
+    }))
 }
 
 /// Runs Git and returns stdout, turning a non-zero exit into
@@ -84,16 +171,34 @@ pub(crate) fn strip_newline(bytes: &[u8]) -> &[u8] {
 /// UTF-16 itself, so on Windows the bytes are decoded strictly as UTF-8;
 /// anything else is reported as malformed rather than silently replaced.
 #[cfg(unix)]
-pub(crate) fn path_from_git(bytes: &[u8]) -> Result<PathBuf> {
+pub fn path_from_git(bytes: &[u8]) -> Result<PathBuf> {
     use std::os::unix::ffi::OsStrExt;
     Ok(PathBuf::from(OsStr::from_bytes(bytes)))
 }
 
 #[cfg(not(unix))]
-pub(crate) fn path_from_git(bytes: &[u8]) -> Result<PathBuf> {
+pub fn path_from_git(bytes: &[u8]) -> Result<PathBuf> {
     std::str::from_utf8(bytes)
         .map(PathBuf::from)
         .map_err(|e| GitError::malformed("path is not valid UTF-8", e.to_string()))
+}
+
+/// The bytes Git uses for a native path: the inverse of [`path_from_git`].
+#[cfg(unix)]
+pub fn path_bytes(path: &Path) -> Cow<'_, [u8]> {
+    use std::os::unix::ffi::OsStrExt;
+    Cow::Borrowed(path.as_os_str().as_bytes())
+}
+
+/// The bytes Git uses for a native path: the inverse of [`path_from_git`].
+/// Paths produced by Diffkit are valid UTF-8 on Windows; any other path is
+/// converted with replacement and can never match a Git path.
+#[cfg(not(unix))]
+pub fn path_bytes(path: &Path) -> Cow<'_, [u8]> {
+    match path.to_string_lossy() {
+        Cow::Borrowed(s) => Cow::Borrowed(s.as_bytes()),
+        Cow::Owned(s) => Cow::Owned(s.into_bytes()),
+    }
 }
 
 #[cfg(test)]
@@ -143,5 +248,28 @@ mod tests {
             }
             other => panic!("unexpected error: {other}"),
         }
+    }
+
+    #[test]
+    fn limited_output_reports_overflow_instead_of_truncating() {
+        let dir = std::env::temp_dir();
+        match output_limited(&dir, &["--version"], 4).unwrap() {
+            LimitedOutput::Exceeded { limit } => assert_eq!(limit, 4),
+            LimitedOutput::Complete(_) => panic!("`git --version` is longer than 4 bytes"),
+        }
+        match output_limited(&dir, &["--version"], 1 << 20).unwrap() {
+            LimitedOutput::Complete(out) => {
+                assert!(out.status.success());
+                assert!(out.stdout.starts_with(b"git version"));
+            }
+            LimitedOutput::Exceeded { .. } => panic!("unexpected overflow"),
+        }
+    }
+
+    #[test]
+    fn invocations_are_counted_per_thread() {
+        let before = thread_invocations();
+        let _ = output(&std::env::temp_dir(), &["--version"]);
+        assert_eq!(thread_invocations(), before + 1);
     }
 }

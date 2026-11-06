@@ -421,6 +421,7 @@ mod tests {
                 kind: RepositoryKind::Standard,
                 is_inside_work_tree: true,
                 shallow: false,
+                object_format: ObjectFormat::Sha1,
             },
             branch: BranchInfo {
                 head: HeadState::Branch("main".into()),

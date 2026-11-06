@@ -86,3 +86,53 @@ unusual ones; worktree tests also assert the main repository is unaffected.
 5,000, and 50,000 tracked files, each tracking a local bare remote. It
 times the release binary over warm-up and measured runs, clean and dirty;
 see `PERFORMANCE_BUDGET.md`.
+
+## Phase 2: diff engine tests
+
+### Unit tests (`src/diff/**`)
+
+- `parser`: single and multiple files and hunks; all hunk header forms
+  (missing count = 1, zero-line, `@@ -0,0`, `+5,0`); additions and deletions
+  with `/dev/null`; empty files; rename, copy, and dissimilarity metadata;
+  mode-only changes; binary notices; no-newline markers; C-quoted paths
+  (octal escapes, `\t`, `\n`, `\"`); the space-marker tab after plain and
+  quoted names; mixed quoted/unquoted headers; non-UTF-8 paths and content;
+  content lines that look like headers; `diff --cc` and `* Unmerged path`
+  sections; preservation of unknown headers; 12 malformed or truncated inputs;
+  error line numbers.
+- `alignment`: single and multiple line replacement; insertion only;
+  deletion only; unrelated lines not paired; reordering; repeated lines
+  (deterministic and minimal); empty lines and CRLF vs LF; identical and
+  empty inputs; insertion before a modification; a 20,000-line block with no
+  common lines; a 3,000-line block with every 7th line changed; the explicit
+  edit-cost bound (bounded, deterministic, valid script); and **Myers
+  minimality on 2,000 random inputs against an O(N·M) edit-distance oracle**
+  (the oracle exists only in tests).
+- `hunk`: independent old/new numbering, zero-count hunks, CRLF/LF/no-EOL
+  decoding, `\r` without newline, overlapping hunks rejected, line splitting,
+  synthesized addition headers.
+- `discovery`: raw/numstat pairing, paths with tabs/newlines/colons,
+  stat-only records dropped and counted, malformed output, unmerged U+M
+  folding, kind classification (ModeChanged, TypeChanged).
+- `commands`, `binary`, `errors`: argument shapes per comparison, pathspecs
+  after `--`, the binary heuristic (NUL in 8000 bytes; non-UTF-8 is not
+  binary), error messages.
+
+### Integration tests (real Git, temporary repositories)
+
+| File | Covers |
+|---|---|
+| `diff_comparisons.rs` | Clean repository; partial staging asserting HEAD→index, index→worktree, HEAD→worktree rows, line numbers, and object IDs; combined ≠ sum; independent line numbers; staged addition and deletion; unstaged deletion; renames with and without edits; copies; mode-only and mode+content changes; separated hunks with context 0/3/20; multiple files; unborn HEAD (empty-tree base); a 50,000-line file with 50 hunks; exact subprocess counts; stat-only files dropped without an index write |
+| `diff_special_files.rs` | Binary add, modify, and delete (with sizes); symlink target change; file → symlink type change; empty files; missing final newline; CRLF and mixed endings; non-UTF-8 content; conflicts in staged and unstaged (`Unmerged`, `load_all` clean) and combined (flagged); submodule commit and dirty state |
+| `diff_untracked.rs` | Text, empty, no-EOL, CRLF, binary, Unicode, nested; ignored files and `info/exclude`; no index or object writes; size limit; vanished and changed files; symlinks not followed; directory swapped for an outside symlink refused; unreadable files; nested repositories; non-UTF-8 names (skipped on APFS) |
+| `diff_lazy_loading.rs` | Discovery metadata vs loaded content; restaged file (`ObjectChanged`); edited or deleted working-tree file (`WorkingTreeChanged`); reverted change (`MissingFromDiff`); `load_all` equals per-file loads and reports new changes; unknown `FileId`; per-file and total patch limits with fallback |
+| `diff_paths.rs` | 13 hostile names (spaces, tab, newline, quotes, backslash, leading dash, ` -> `, glob characters, pathspec magic `:(attr:…)`, `:!`, Unicode, emoji) in all three comparisons and through `load_all`; renames keeping both unusual paths; a non-UTF-8 tracked path via the index; a portable Unicode subset |
+| `diff_read_only.rs` | Byte-level fingerprints unchanged after `diff-stats --load` and every API call; `diff.external` and textconv never run, with a positive control; Git invocation audit of `diff-stats --load` |
+| `diff_cli.rs` | `diffkit diff-stats` and `--load` output; errors and usage |
+
+Platform-dependent coverage: on-disk non-UTF-8 names log `SKIPPED` on APFS.
+Non-UTF-8 tracked paths are exercised through the index instead.
+Permission tests skip as root. Windows code compiles and passes clippy for
+`x86_64-pc-windows-msvc`, but has not been run.
+
+Benchmarks: `examples/bench_diff.rs` (see `PERFORMANCE_BUDGET.md`).
