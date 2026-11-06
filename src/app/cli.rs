@@ -10,6 +10,7 @@ use diffkit::{
 use std::{
     ffi::OsString,
     io::{self, Write},
+    path::Path,
 };
 
 fn usage() -> String {
@@ -17,22 +18,33 @@ fn usage() -> String {
         "diffkit {}\n\
          Read-only Git repository inspector.\n\n\
          Usage:\n  \
-         diffkit inspect     Inspect the repository containing the current directory\n  \
+         diffkit [PATH]      Open the interactive viewer for the repository containing\n                      \
+         PATH (default: the current directory); press ? inside for keys\n  \
+         diffkit inspect     Print a report for the repository containing the current directory\n  \
          diffkit diff-stats [--load]\n                      \
          List changed files per comparison (staged, unstaged,\n                      \
          combined, untracked); --load also parses every diff\n  \
          diffkit --help      Show this help\n  \
          diffkit --version   Show the version\n\n\
+         Subcommand names take priority over directory names; use ./inspect for a\n\
+         directory called inspect.\n\n\
          Diffkit never modifies the repository and never contacts a remote.\n",
         env!("CARGO_PKG_VERSION")
     )
 }
 
 pub fn run(args: Vec<OsString>) -> i32 {
-    let args: Vec<_> = args.iter().map(|a| a.to_string_lossy()).collect();
-    let args: Vec<&str> = args.iter().map(|a| a.as_ref()).collect();
-    match args.as_slice() {
-        [] | ["--help" | "-h" | "help"] => print(&usage()),
+    let text: Vec<_> = args.iter().map(|a| a.to_string_lossy()).collect();
+    let text: Vec<&str> = text.iter().map(|a| a.as_ref()).collect();
+    match text.as_slice() {
+        [] => match std::env::current_dir() {
+            Ok(dir) => tui(&dir),
+            Err(e) => {
+                eprintln!("diffkit: error: cannot read the current directory: {e}");
+                1
+            }
+        },
+        ["--help" | "-h" | "help"] => print(&usage()),
         ["--version" | "-V"] => print(&format!("diffkit {}\n", env!("CARGO_PKG_VERSION"))),
         ["inspect"] => inspect(),
         ["inspect", extra, ..] => usage_error(&format!("unexpected argument for inspect: {extra}")),
@@ -41,7 +53,26 @@ pub fn run(args: Vec<OsString>) -> i32 {
         ["diff-stats", extra, ..] => {
             usage_error(&format!("unexpected argument for diff-stats: {extra}"))
         }
+        [other] if !other.starts_with('-') => {
+            // Use the original OsString: the path may not be UTF-8.
+            let path = Path::new(&args[0]);
+            if path.is_dir() {
+                tui(path)
+            } else {
+                usage_error(&format!("not a command or a directory: {other}"))
+            }
+        }
         [other, ..] => usage_error(&format!("unknown command or option: {other}")),
+    }
+}
+
+fn tui(start: &Path) -> i32 {
+    match diffkit::tui::run(start) {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("diffkit: error: {e}");
+            1
+        }
     }
 }
 

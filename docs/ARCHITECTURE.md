@@ -7,7 +7,8 @@ the binary owns argument handling and presentation.
 ```text
 src/
   main.rs            entry point: passes argv to app::cli and exits with its code
-  lib.rs             exposes `git` and `diff` to the binary, tests, and later phases
+  lib.rs             exposes `git`, `diff`, `display`, and `tui`
+  display.rs         safe display text: path quoting, content sanitizing, truncation
   app/
     cli.rs           argument parsing, dispatch, stdout/stderr, exit codes
     report.rs        formats a RepositorySnapshot as the text report
@@ -32,6 +33,14 @@ src/
     untracked.rs     safe discovery and reading of untracked files
     models.rs        diff data model
     errors.rs        DiffError
+  tui/               Phase 3 terminal interface (Ratatui + Crossterm)
+    app.rs           App state and updates; the only TUI code that calls the engines
+    actions.rs       Action enum
+    keymap.rs        key events → actions
+    diff_view.rs     display rows built once per loaded diff
+    layout.rs        pure screen geometry
+    terminal.rs      terminal guard, panic hook, event loop
+    ui/              rendering: header, sidebar, diff_panel, status, overlays, theme
 ```
 
 ## Layers and responsibilities
@@ -115,3 +124,26 @@ functions with no I/O, so they are unit-tested with byte fixtures. Only
 The engine uses the plumbing commands `diff-index`/`diff-files` because
 porcelain `git diff` rewrites `.git/index` after working-tree comparisons
 even with `GIT_OPTIONAL_LOCKS=0` (see `docs/phases/PHASE_2_DIFF_ENGINE.md`).
+
+## Phase 3: terminal interface
+
+```text
+main → app::cli::run
+  []  or  [PATH]          tui::run(path)        needs a TTY; repository inspected before raw mode
+  inspect / diff-stats    unchanged plain-text commands
+
+tui::run
+  App::open               snapshot::inspect → DiffEngine::from_snapshot → discover ×4 (no diff loaded)
+  TerminalGuard::enter    raw mode, alternate screen, hidden cursor, panic hook
+  loop:
+    terminal.draw(ui::render(&app))           pure: reads App only
+    event → keymap::action_for → app.apply    no Git (except Enter = reload, r = refresh)
+    drain queued events, then app.load_pending()   ≤ 1 load_file_diff → DiffView → cache
+  guard dropped           terminal restored (also on error or panic)
+```
+
+The interface lives in the library (`src/tui/`), so integration tests drive
+`App` and render it through Ratatui's `TestBackend` without a terminal. The
+binary only routes arguments. `display_path` moved from the binary's
+`report.rs` to `src/display.rs` so the report and the interface share it;
+`report.rs` re-exports it.

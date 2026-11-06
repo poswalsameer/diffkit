@@ -171,3 +171,44 @@ Observations:
 
 Not measured: Linux, Windows, cold caches, debug builds, and repositories
 with fsmonitor or untracked cache enabled.
+
+## Phase 3: terminal interface — 2026-11-06
+
+```sh
+cargo run --release --example bench_tui -- 7
+```
+
+Release build, in-process, 1 warm-up and 7 measured runs (median). Frames
+are rendered into a 200×60 Ratatui `TestBackend`, so terminal I/O is not
+included.
+
+| Tracked files | Changed (unstaged) | `App::open` | Git calls | First diff load | Git calls | Total to first diff |
+|---:|---:|---:|---:|---:|---:|---:|
+| 100 | 2 | 26.66 ms | 6 | 3.92 ms | 1 | 30.58 ms |
+| 5,000 | 100 | 40.47 ms | 6 | 3.75 ms | 1 | 44.22 ms |
+| 50,000 | 1,000 | 306.81 ms | 6 | 5.84 ms | 1 | 312.64 ms |
+
+`App::open` is the Phase 1 snapshot (rev-parse and status) plus discovery
+of all four comparisons. No diff content is loaded.
+
+Large diff: a 200,000-line file with every 100th line edited.
+
+| Measure | Result |
+|---|---:|
+| Phase 2 `load_file_diff` alone | 573.47 ms |
+| Building display rows (`DiffView::new`) | 7.94 ms |
+| TUI first load (both; single run) | 565.93 ms |
+| Display rows | 16,000 |
+| One frame | 0.207 ms |
+| PageDown or `]`, then one frame | 0.222 ms, 0 Git calls |
+| One frame at the bottom (single run) | 0.219 ms |
+| Returning to a previously loaded file | 0.000 ms, 0 Git calls |
+
+Compared with Phase 2, the interface adds only display-row construction
+(about 8 ms for 16,000 rows) on top of the engine's load. Frame cost does
+not depend on diff size, because only visible rows are built. Startup adds
+discovery of the three comparisons not on screen (metadata only), so their
+file counts can be shown in the tab bar.
+
+Not measured: real terminal output time (depends on the emulator), memory
+of the interactive process, Linux, and Windows.

@@ -384,3 +384,45 @@ pub fn row(
 pub fn numbered(prefix: &str, n: usize) -> String {
     (1..=n).map(|i| format!("{prefix}{i}\n")).collect()
 }
+
+// ----------------------------------------------------------------- tui helpers
+
+use diffkit::tui::{ui, App};
+use ratatui::{backend::TestBackend, buffer::Buffer, layout::Rect, Terminal};
+
+/// Opens the TUI state for `path` at the given size and loads the selected
+/// file, as the event loop does before its first frame.
+pub fn tui_app(path: &Path, width: u16, height: u16) -> App {
+    isolate();
+    let mut app = App::open(path, Rect::new(0, 0, width, height)).expect("open app");
+    app.load_pending();
+    app
+}
+
+/// Renders the app into a test backend of the app's size.
+pub fn render_buffer(app: &App) -> Buffer {
+    let size = app.size();
+    let mut t = Terminal::new(TestBackend::new(size.width, size.height)).unwrap();
+    t.draw(|f| ui::render(f, app)).unwrap();
+    t.backend().buffer().clone()
+}
+
+/// The rendered screen as one string per row.
+pub fn screen(app: &App) -> Vec<String> {
+    lines_of(&render_buffer(app))
+}
+
+pub fn lines_of(buf: &Buffer) -> Vec<String> {
+    let area = buf.area;
+    (area.y..area.y + area.height)
+        .map(|y| {
+            (area.x..area.x + area.width)
+                .map(|x| buf[(x, y)].symbol())
+                .collect()
+        })
+        .collect()
+}
+
+pub fn screen_text(app: &App) -> String {
+    screen(app).join("\n")
+}

@@ -25,13 +25,24 @@ fn assert_field(out: &str, label: &str, lines: &[&str]) {
 #[test]
 fn help_version_and_default() {
     let tmp = TempDir::new("cli-help");
-    for args in [&[][..], &["--help"], &["-h"]] {
+    for args in [&["--help"][..], &["-h"]] {
         let out = diffkit(tmp.path(), args);
         assert_eq!(out.status.code(), Some(0));
         let text = stdout(&out);
         assert!(text.contains("Usage:"), "{text}");
         assert!(text.contains("diffkit inspect"));
     }
+    // Phase 3: with no arguments Diffkit opens the interactive viewer. In
+    // tests stdout is a pipe, so it refuses with a clear message instead.
+    let out = diffkit(tmp.path(), &[]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(stdout(&out).is_empty());
+    assert!(
+        stderr(&out).contains("needs a terminal"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(stderr(&out).contains("diffkit inspect"));
     for args in [&["--version"][..], &["-V"]] {
         let out = diffkit(tmp.path(), args);
         assert_eq!(out.status.code(), Some(0));

@@ -53,9 +53,20 @@ Phase 1 report, Known Limitations).
 
 ## Dependencies
 
-Phase 1 uses only the Rust standard library. Adding a dependency requires
-explicit approval stating its name, purpose, why std is insufficient, its
-cost, and the feature that needs it.
+The Git and diff engines use only the Rust standard library. The Phase 3
+interface uses `ratatui`, `crossterm`, and `unicode-width` (see
+`TECH_STACK.md`). Adding any other dependency requires explicit approval
+stating its name, purpose, why std is insufficient, its cost, and the
+feature that needs it.
+
+## Terminal interface (Phase 3)
+
+- Only `tui::app` calls the engines. Rendering (`tui::ui`) reads state and
+  never runs Git, reads files, parses, or aligns.
+- Everything shown is escaped through `display`. No byte from a filename or
+  file content reaches the terminal as a control sequence.
+- The terminal is always restored (RAII guard plus panic hook). Logs are
+  never printed while the interface is active.
 
 ## Error handling
 

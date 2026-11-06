@@ -25,4 +25,15 @@
 
 ## Approved dependencies
 
-None. No dependency was added in Phase 1 or Phase 2.
+Phase 1 and Phase 2 use only the standard library. Phase 3 adds three
+dependencies, each required by the terminal interface:
+
+| Crate | Version | Purpose |
+|---|---|---|
+| `ratatui` | 0.30.2, `default-features = false`, features `crossterm_0_29`, `layout-cache` | Terminal UI rendering (layout, widgets, buffers, test backend). The calendar widget and macros are excluded. |
+| `crossterm` | 0.29.0 | Raw mode, alternate screen, cursor, and keyboard/resize events. The same version Ratatui's backend uses, so one copy is built. |
+| `unicode-width` | 0.2.3 | Display width of characters, for truncating file names and expanding tabs correctly with wide (CJK, emoji) characters. Already a Ratatui dependency at this version; listing it adds no new code. |
+
+Transitive dependencies come from these crates (`cargo tree`). There is no
+async runtime, Git library, database, network client, or syntax
+highlighter.

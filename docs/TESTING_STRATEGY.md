@@ -136,3 +136,58 @@ Permission tests skip as root. Windows code compiles and passes clippy for
 `x86_64-pc-windows-msvc`, but has not been run.
 
 Benchmarks: `examples/bench_diff.rs` (see `PERFORMANCE_BUDGET.md`).
+
+## Phase 3: terminal interface tests
+
+- **Unit tests:**
+  - `display`: tab expansion, control pictures for C0/DEL, escapes for
+    C1/bidi/invalid bytes, path escaping of format controls,
+    width-aware truncation.
+  - `tui::layout`: too-small sizes, tiling, sidebar bounds, column widths,
+    narrow-panel requirement.
+  - `tui::keymap`: every documented binding; modifiers and key releases
+    don't alias; overlays capture keys.
+- **`tests/tui_app.rs` (17, real repositories):**
+  - Startup runs 6 Git calls and loads no diff; the first load is 1 call.
+  - Selection bounds; empty repository.
+  - Comparison switching with partial staging (A→B, B→C, A→C rows).
+  - Per-comparison selection memory.
+  - Vertical and horizontal scroll bounds.
+  - Hunk navigation, with and without hunks.
+  - Help overlay and status dismissal.
+  - Refresh keeping the selection by identity, and picking up external
+    staging.
+  - Stale file reported and not shown.
+  - Cache reuse (0 Git calls) and Enter reload (1 call).
+  - **Rendering, scrolling, resizing, and overlays run 0 Git calls.**
+  - Resizing keeps scroll valid; sidebar hide and resize.
+  - A full flow over rename, deletion, binary, conflict, and untracked files
+    in all four modes.
+- **`tests/tui_render.rs` (14, `TestBackend`):**
+  - All regions at 120×40 and 80×24.
+  - Numbers, markers, and colors of context, modified, and inserted rows.
+  - One-sided added and deleted files.
+  - No-newline and CRLF markers.
+  - Binary, conflict (unstaged and combined), mode change, rename, and
+    empty-file notices.
+  - Narrow fallback; too-small warning.
+  - No panic over 99 sizes × overlays × scrolling.
+  - 150-file sidebar; long-name truncation.
+  - Horizontal scrolling with fixed gutters.
+  - Escape sequences in content and filenames never reach the buffer.
+  - Header tracking and detached states.
+- **`tests/tui_cli.rs` (4):**
+  - Argument routing without a TTY.
+  - Real pseudo-terminal sessions through `script(1)` (macOS/Linux): launch,
+    keys, quit with exit 0, the alternate screen left and cursor shown last,
+    no cursor-position query, explicit path argument, and repository errors
+    printed before the terminal is touched.
+- **`tests/tui_panic.rs` (1):** the panic hook chains to the previous hook
+  (its own binary, since hooks are global).
+
+Phase 1's `cli_inspect::help_version_and_default` was updated for the one
+intended behavior change: `diffkit` with no arguments now opens the viewer,
+and without a terminal exits 1 with a message. The `--help`, `-h`, and
+`--version` assertions are unchanged.
+
+Benchmarks: `examples/bench_tui.rs`.

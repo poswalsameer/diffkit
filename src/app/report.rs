@@ -9,7 +9,7 @@ use diffkit::git::models::{
     BranchInfo, Change, CommitTrackingInfo, FileStatus, HeadState, RepositoryKind,
     RepositorySnapshot, RepositoryStatus, TrackingRelation, TrackingUnavailable, UpstreamInfo,
 };
-use std::{fmt::Write, path::Path};
+use std::fmt::Write;
 
 const RULE: &str = "------------------------------------------------------------";
 
@@ -311,61 +311,13 @@ fn entry_path(f: &FileStatus) -> String {
     }
 }
 
-/// Displays a path, quoting and escaping it if it would otherwise be
-/// ambiguous or invisible in a line-oriented report.
-pub fn display_path(path: &Path) -> String {
-    #[cfg(unix)]
-    let bytes = {
-        use std::os::unix::ffi::OsStrExt;
-        path.as_os_str().as_bytes()
-    };
-    #[cfg(not(unix))]
-    let lossy = path.to_string_lossy();
-    #[cfg(not(unix))]
-    let bytes = lossy.as_bytes();
-
-    let mut quoted = String::new();
-    let mut needs_quotes = false;
-    #[cfg(not(unix))]
-    {
-        needs_quotes |= path.to_str().is_none();
-    }
-    for chunk in bytes.utf8_chunks() {
-        for c in chunk.valid().chars() {
-            match c {
-                '\n' => quoted.push_str("\\n"),
-                '\t' => quoted.push_str("\\t"),
-                '\r' => quoted.push_str("\\r"),
-                '"' => quoted.push_str("\\\""),
-                '\\' => quoted.push_str("\\\\"),
-                c if c.is_control() => {
-                    let _ = write!(quoted, "\\u{{{:x}}}", u32::from(c));
-                }
-                c => {
-                    quoted.push(c);
-                    continue;
-                }
-            }
-            needs_quotes = true;
-        }
-        for b in chunk.invalid() {
-            let _ = write!(quoted, "\\x{b:02x}");
-            needs_quotes = true;
-        }
-    }
-    let padded = quoted.starts_with(char::is_whitespace) || quoted.ends_with(char::is_whitespace);
-    if needs_quotes || padded || quoted.is_empty() || quoted.contains(" -> ") {
-        format!("\"{quoted}\"")
-    } else {
-        quoted
-    }
-}
+pub use diffkit::display::display_path;
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use diffkit::git::models::*;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn plain_paths_are_unquoted() {
