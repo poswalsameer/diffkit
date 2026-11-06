@@ -124,6 +124,7 @@ pub fn mode_title(c: DiffComparison) -> &'static str {
         DiffComparison::Unstaged => "UNSTAGED",
         DiffComparison::Combined => "COMBINED",
         DiffComparison::Untracked => "UNTRACKED",
+        DiffComparison::Commit => "COMMIT",
     }
 }
 
@@ -134,5 +135,6 @@ pub fn side_labels(c: DiffComparison) -> (&'static str, &'static str) {
         DiffComparison::Unstaged => ("OLD · index", "NEW · working tree"),
         DiffComparison::Combined => ("OLD · HEAD", "NEW · working tree"),
         DiffComparison::Untracked => ("OLD · (not tracked)", "NEW · working tree"),
+        DiffComparison::Commit => ("OLD · parent", "NEW · commit"),
     }
 }

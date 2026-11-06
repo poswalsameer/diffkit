@@ -1,10 +1,21 @@
 [package]
 name = "diffkit"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
+rust-version = "1.88"
 description = "Read-only Git repository inspector"
 
 [dependencies]
 crossterm = "0.29.0"
+notify = "8.2.1"
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm_0_29", "layout-cache"] }
 unicode-width = "0.2.3"
+
+[target.'cfg(unix)'.dependencies]
+signal-hook = "0.3.18"
+
+# Release binaries: whole-program optimization. Unwinding stays enabled so
+# the panic hook can restore the terminal.
+[profile.release]
+lto = true
+codegen-units = 1

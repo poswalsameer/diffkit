@@ -3,6 +3,7 @@
 
 mod diff_panel;
 mod header;
+mod history;
 mod overlays;
 mod sidebar;
 mod status;
@@ -23,11 +24,31 @@ pub fn render(frame: &mut Frame, app: &App) {
         return;
     };
     header::render(frame, app, screen.header);
-    header::render_tabs(frame, app, screen.tabs);
-    if let Some(sidebar) = screen.sidebar {
-        sidebar::render(frame, app, sidebar);
+    match app.history() {
+        Some(h) => {
+            history::render_bar(frame, app, screen.tabs);
+            let commit_open = h.open.is_some();
+            if let Some(sidebar) = screen.sidebar {
+                if commit_open {
+                    sidebar::render(frame, app, sidebar);
+                } else {
+                    history::render_list(frame, app, sidebar);
+                }
+            }
+            if commit_open {
+                diff_panel::render(frame, app, screen.diff);
+            } else {
+                history::render_details(frame, app, screen.diff);
+            }
+        }
+        None => {
+            header::render_tabs(frame, app, screen.tabs);
+            if let Some(sidebar) = screen.sidebar {
+                sidebar::render(frame, app, sidebar);
+            }
+            diff_panel::render(frame, app, screen.diff);
+        }
     }
-    diff_panel::render(frame, app, screen.diff);
     status::render(frame, app, screen.status);
     status::render_footer(frame, app, screen.footer);
     overlays::render(frame, app, area);

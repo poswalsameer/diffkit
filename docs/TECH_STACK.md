@@ -33,6 +33,8 @@ dependencies, each required by the terminal interface:
 | `ratatui` | 0.30.2, `default-features = false`, features `crossterm_0_29`, `layout-cache` | Terminal UI rendering (layout, widgets, buffers, test backend). The calendar widget and macros are excluded. |
 | `crossterm` | 0.29.0 | Raw mode, alternate screen, cursor, and keyboard/resize events. The same version Ratatui's backend uses, so one copy is built. |
 | `unicode-width` | 0.2.3 | Display width of characters, for truncating file names and expanding tabs correctly with wide (CJK, emoji) characters. Already a Ratatui dependency at this version; listing it adds no new code. |
+| `notify` | 8.2.1 (latest stable; 9.0 is a release candidate), default features | Phase 4 filesystem notifications: FSEvents on macOS, inotify on Linux, ReadDirectoryChangesW on Windows. Used through its callback API, with no async runtime and no notify-debouncer crate; debouncing is Diffkit's own. |
+| `signal-hook` | 0.3.18, Unix only | Phase 5: SIGTERM, SIGHUP, and SIGINT end the interactive session through the normal exit path, so the terminal is restored. Already in the lockfile as a Crossterm dependency at this version, so it adds no new crate. |
 
 Transitive dependencies come from these crates (`cargo tree`). There is no
 async runtime, Git library, database, network client, or syntax

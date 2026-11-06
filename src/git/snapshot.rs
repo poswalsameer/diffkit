@@ -9,24 +9,38 @@
 //!    configured and its ref exists (or HEAD is unborn);
 //! 4. `for-each-ref --count=1`, only when HEAD is unborn.
 //!
+//! Operations in progress are read from state files in the Git directory
+//! ([`state::detect`]), without a Git process.
+//!
 //! The commands run one after another, so a concurrent Git operation can
 //! land between them; the snapshot is consistent per command, not atomic.
 
-use super::{branches, commits, errors::Result, models::RepositorySnapshot, repository, status};
+use super::{
+    branches, commits, errors::Result, models::RepositorySnapshot, repository, state, status,
+};
 use std::path::Path;
 
 pub fn inspect(start: &Path) -> Result<RepositorySnapshot> {
-    let repository = repository::discover_from(start)?;
+    inspect_repository(repository::discover_from(start)?)
+}
+
+/// Like [`inspect`], for a repository already discovered with
+/// [`repository::discover_from`] (no second `rev-parse`).
+pub fn inspect_repository(
+    repository: crate::git::models::RepositoryInfo,
+) -> Result<RepositorySnapshot> {
     let report = status::read(&repository.root)?;
     let branch = branches::resolve(&repository.root, &report.headers)?;
     let upstream = branches::resolve_upstream(&repository.root, &report.headers, &branch)?;
     let commit_tracking = commits::tracking(&report.headers, &branch, &upstream)?;
+    let operations = state::detect(&repository.git_dir);
     Ok(RepositorySnapshot {
         repository,
         branch,
         upstream,
         commit_tracking,
         status: report.status,
+        operations,
     })
 }
 

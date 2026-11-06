@@ -60,20 +60,43 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
         }
         HeadState::Unknown => spans.push(Span::styled("HEAD unknown", theme::warning())),
     }
+    for op in &s.operations {
+        spans.push(Span::styled(" │ ", theme::muted()));
+        spans.push(Span::styled(escape_text(&op.label()), theme::warning()));
+    }
+    let conflicts = s.status.conflicted_count();
+    if conflicts > 0 {
+        spans.push(Span::styled(
+            format!(
+                " ⚠ {conflicts} conflict{}",
+                if conflicts == 1 { "" } else { "s" }
+            ),
+            theme::conflict(),
+        ));
+    }
+    // An upstream is usually a remote-tracking ref: Git's record of the
+    // remote branch as of the last fetch, never the server's current state.
+    let source = |full_ref: &Option<String>| match full_ref {
+        Some(r) if r.starts_with("refs/heads/") => "local branch",
+        _ => "remote-tracking ref, as last fetched",
+    };
     match (&s.upstream, s.commit_tracking) {
-        (UpstreamInfo::Available { name, .. }, CommitTrackingInfo::Compared { ahead, behind }) => {
+        (
+            UpstreamInfo::Available { name, full_ref, .. },
+            CommitTrackingInfo::Compared { ahead, behind },
+        ) => {
             spans.push(Span::raw(" "));
             spans.push(Span::styled(format!("↑{ahead}"), theme::added()));
             spans.push(Span::raw(" "));
             spans.push(Span::styled(format!("↓{behind}"), theme::removed()));
             spans.push(Span::styled(
-                format!(" vs {} (local ref, not fetched)", escape_text(name)),
+                format!(" vs {} ({})", escape_text(name), source(full_ref)),
                 theme::muted(),
             ));
         }
-        (UpstreamInfo::Available { name, .. }, _) => {
+        (UpstreamInfo::Available { name, full_ref, .. }, _) => {
             spans.push(Span::styled(
-                format!(" tracking {} (local ref)", escape_text(name)),
+                format!(" tracking {} ({})", escape_text(name), source(full_ref)),
                 theme::muted(),
             ));
         }

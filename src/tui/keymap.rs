@@ -30,6 +30,14 @@ pub fn action_for(key: KeyEvent, overlay: Option<&Overlay>) -> Option<Action> {
                 _ => None,
             }
         }
+        Some(Overlay::Diagnostics) => {
+            return match key.code {
+                KeyCode::Esc | KeyCode::Char('D') => Some(Action::CloseOverlay),
+                KeyCode::Char('q') => Some(Action::Quit),
+                KeyCode::Char('r') => Some(Action::Refresh),
+                _ => None,
+            }
+        }
         Some(Overlay::Error { .. }) => {
             return match key.code {
                 KeyCode::Esc | KeyCode::Enter => Some(Action::CloseOverlay),
@@ -44,6 +52,8 @@ pub fn action_for(key: KeyEvent, overlay: Option<&Overlay>) -> Option<Action> {
         KeyCode::Char('q') => Action::Quit,
         KeyCode::Esc => Action::CloseOverlay,
         KeyCode::Char('?') => Action::ToggleHelp,
+        KeyCode::Char('D') => Action::ToggleDiagnostics,
+        KeyCode::Char('L') => Action::ToggleHistory,
         KeyCode::Char('j') | KeyCode::Down => Action::SelectNextFile,
         KeyCode::Char('k') | KeyCode::Up => Action::SelectPreviousFile,
         KeyCode::Home => Action::SelectFirstFile,
@@ -141,6 +151,14 @@ mod tests {
             (plain('['), Action::PreviousHunk),
             (plain('r'), Action::Refresh),
             (plain('?'), Action::ToggleHelp),
+            (
+                key(KeyCode::Char('D'), KeyModifiers::SHIFT),
+                Action::ToggleDiagnostics,
+            ),
+            (
+                key(KeyCode::Char('L'), KeyModifiers::SHIFT),
+                Action::ToggleHistory,
+            ),
             (key(KeyCode::Esc, KeyModifiers::NONE), Action::CloseOverlay),
             (plain('q'), Action::Quit),
             (key(KeyCode::Char('c'), KeyModifiers::CONTROL), Action::Quit),

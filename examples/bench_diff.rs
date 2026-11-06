@@ -317,7 +317,10 @@ fn main() {
         let loaded = engine.load_file_diff(&list, f.id).unwrap();
         let args = diff::commands::patch(
             DiffComparison::Unstaged,
-            &engine.base(),
+            diff::commands::Range {
+                base: &engine.base(),
+                target: None,
+            },
             3,
             &[Path::new(name)],
         );

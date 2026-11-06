@@ -412,7 +412,7 @@ fn header_shows_tracking_and_detached_states() {
     let app = tui_app(&repo.path, 140, 30);
     let header = &screen(&app)[0];
     assert!(
-        header.contains("⎇ main ↑1 ↓0 vs origin/main (local ref, not fetched)"),
+        header.contains("⎇ main ↑1 ↓0 vs origin/main (remote-tracking ref, as last fetched)"),
         "{header}"
     );
     repo.git(&["checkout", "-q", "--detach"]);

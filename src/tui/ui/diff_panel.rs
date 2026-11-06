@@ -4,9 +4,12 @@
 
 use super::{sidebar::file_label, theme};
 use crate::{
-    diff::{DiffRowKind, FileChangeKind},
+    diff::{
+        ConflictInfo, DiffComparison, DiffRowKind, FileChangeKind, FileMode, SubmoduleChange,
+        SubmoduleWorktree,
+    },
     display::{display_path, escape_text, truncate_start},
-    git::models::FileKind,
+    git::models::{ConflictStage, FileKind, FileStatus},
     tui::{
         app::{App, FailureKind, Loaded},
         diff_view::{Body, Cell, DiffView, Notice, ViewRow, CRLF_MARK, NO_NEWLINE_MARK},
@@ -21,8 +24,10 @@ use ratatui::{
     Frame,
 };
 
+/// Renders the diff on screen: the selected file of the current comparison
+/// or, on the history screen, of the opened commit.
 pub fn render(frame: &mut Frame, app: &App, area: Rect) {
-    let file = app.selected_file();
+    let file = app.active_file();
     let title = match file {
         Some(f) => format!(
             " {} ",
@@ -36,11 +41,13 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
 
     match (file, app.loaded()) {
         (None, _) => {
-            let state = app.mode_state(app.mode());
-            let text = if state.list.is_err() {
-                "The file list could not be loaded."
-            } else {
-                "Nothing to show in this comparison."
+            let text = match app.history().and_then(|h| h.open.as_ref()) {
+                Some(c) if c.list.is_err() => "The files of this commit could not be listed.",
+                Some(_) => "This commit changes no files compared with its first parent.",
+                None if app.mode_state(app.mode()).list.is_err() => {
+                    "The file list could not be loaded."
+                }
+                None => "Nothing to show in this comparison.",
             };
             message(frame, inner, vec![Line::styled(text, theme::muted())]);
         }
@@ -67,6 +74,18 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
             );
         }
         (Some(_), Some(Loaded::View(v))) => view(frame, app, v, area, inner),
+    }
+}
+
+/// What a mode means, in words.
+pub fn kind_label(mode: FileMode) -> String {
+    match mode.kind() {
+        Some(FileKind::Regular) => "regular file".into(),
+        Some(FileKind::Executable) => "executable file".into(),
+        Some(FileKind::Symlink) => "symlink".into(),
+        Some(FileKind::Submodule) => "submodule (gitlink)".into(),
+        Some(FileKind::Other(m)) => format!("mode {m:o}"),
+        None => "nothing".into(),
     }
 }
 
@@ -110,6 +129,12 @@ fn meta_line(v: &DiffView) -> Line<'static> {
         spans.push(Span::styled(format!(" ({s}% similar)"), theme::muted()));
     }
     match (f.old_mode, f.new_mode) {
+        (Some(o), Some(n)) if o.kind() != n.kind() && f.kind == FileChangeKind::TypeChanged => {
+            spans.push(Span::styled(
+                format!(" · {} → {}", kind_label(o), kind_label(n)),
+                theme::modified(),
+            ));
+        }
         (Some(o), Some(n)) if o != n => {
             spans.push(Span::styled(
                 format!(" · mode {:o} → {:o}", o.0, n.0),
@@ -152,7 +177,118 @@ fn meta_line(v: &DiffView) -> Line<'static> {
     Line::from(spans)
 }
 
-fn notice_lines(v: &DiffView, notice: &Notice) -> Vec<Line<'static>> {
+fn stage_line(name: &str, stage: &Option<ConflictStage>) -> Line<'static> {
+    let text = match stage {
+        Some(s) => format!(
+            "{name:<8}{} {}",
+            &s.oid.as_str()[..12],
+            kind_label(FileMode(s.mode))
+        ),
+        None => format!("{name:<8}(no version on this side)"),
+    };
+    Line::raw(text)
+}
+
+fn conflict_lines(c: &ConflictInfo) -> Vec<Line<'static>> {
+    let mut lines = vec![
+        Line::styled("⚠ CONFLICT — this path is unmerged", theme::conflict()),
+        Line::raw(match c.kind {
+            Some(k) => format!("Git reports: {}.", k.description()),
+            None => "Git did not classify this conflict.".into(),
+        }),
+        Line::raw(""),
+    ];
+    match &c.stages {
+        Some(st) => {
+            lines.push(Line::styled(
+                "Index stages recorded by Git:",
+                theme::title(),
+            ));
+            lines.push(stage_line("base", &st.base));
+            lines.push(stage_line("ours", &st.ours));
+            lines.push(stage_line("theirs", &st.theirs));
+        }
+        None => lines.push(Line::styled(
+            "Git did not report the index stages for this path.",
+            theme::muted(),
+        )),
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::raw(if c.worktree_present {
+        "Working tree: the file exists (it usually contains conflict markers)."
+    } else {
+        "Working tree: no file at this path."
+    }));
+    lines.push(Line::raw(
+        "COMBINED (3) shows HEAD → working tree, including conflict markers.",
+    ));
+    lines.push(Line::styled(
+        "Diffkit never resolves conflicts or modifies files.",
+        theme::muted(),
+    ));
+    lines
+}
+
+fn submodule_lines(s: &SubmoduleChange, status: Option<&FileStatus>) -> Vec<Line<'static>> {
+    let id = |c: &Option<crate::git::models::ObjectId>, none: &str| {
+        c.as_ref()
+            .map_or(none.to_string(), |c| c.as_str()[..12].to_string())
+    };
+    let mut lines = vec![
+        Line::styled("Submodule (gitlink)", theme::title()),
+        Line::raw(""),
+        Line::raw(format!(
+            "Recorded commit {} → {}",
+            id(&s.old_commit, "(none)"),
+            id(&s.new_commit, "(working tree)")
+        )),
+    ];
+    match s.worktree {
+        Some(SubmoduleWorktree::Populated) | None => {}
+        Some(SubmoduleWorktree::NotInitialized) => lines.push(Line::styled(
+            "Not initialized: its directory is empty (git submodule update has not run).",
+            theme::warning(),
+        )),
+        Some(SubmoduleWorktree::Missing) => lines.push(Line::styled(
+            "Its directory is missing from the working tree.",
+            theme::warning(),
+        )),
+        Some(SubmoduleWorktree::NotADirectory) => lines.push(Line::styled(
+            "Something other than a directory is at its path.",
+            theme::warning(),
+        )),
+    }
+    if let Some(sub) = status.and_then(|f| f.submodule) {
+        let mut notes = Vec::new();
+        if sub.commit_changed {
+            notes.push("its checked-out commit differs from the recorded one");
+        }
+        if sub.has_tracked_changes {
+            notes.push("it has modified tracked files");
+        }
+        if sub.has_untracked_changes {
+            notes.push("it has untracked files");
+        }
+        if !notes.is_empty() {
+            lines.push(Line::styled(
+                format!("Git reports: {}.", notes.join("; ")),
+                theme::warning(),
+            ));
+        }
+    } else if s.new_dirty {
+        lines.push(Line::styled(
+            "The submodule has uncommitted changes.",
+            theme::warning(),
+        ));
+    }
+    lines.push(Line::styled(
+        "Submodule contents are not inspected; open Diffkit inside it to see them.",
+        theme::muted(),
+    ));
+    lines
+}
+
+fn notice_lines(app: &App, v: &DiffView, notice: &Notice) -> Vec<Line<'static>> {
     let size = |s: Option<u64>| s.map_or("—".to_string(), |b| format!("{b} bytes"));
     match notice {
         Notice::Binary(b) => vec![
@@ -161,43 +297,12 @@ fn notice_lines(v: &DiffView, notice: &Notice) -> Vec<Line<'static>> {
             Line::raw(format!("Size: {} → {}", size(b.old_size), size(b.new_size))),
         ],
         Notice::Submodule(s) => {
-            let id = |c: &Option<crate::git::models::ObjectId>, none: &str| {
-                c.as_ref()
-                    .map_or(none.to_string(), |c| c.as_str()[..12].to_string())
-            };
-            let mut lines = vec![
-                Line::styled("Submodule change", theme::title()),
-                Line::raw(""),
-                Line::raw(format!(
-                    "Commit {} → {}",
-                    id(&s.old_commit, "(none)"),
-                    id(&s.new_commit, "(working tree)")
-                )),
-            ];
-            if s.new_dirty {
-                lines.push(Line::styled(
-                    "The submodule has uncommitted changes.",
-                    theme::warning(),
-                ));
-            }
-            lines.push(Line::styled(
-                "Submodule contents are not shown.",
-                theme::muted(),
-            ));
-            lines
+            let status = (v.file.comparison != DiffComparison::Commit)
+                .then(|| app.status_of(v.file.path()))
+                .flatten();
+            submodule_lines(s, status)
         }
-        Notice::Unmerged => vec![
-            Line::styled("⚠ CONFLICT — this path is unmerged", theme::conflict()),
-            Line::raw(""),
-            Line::raw("Git has no two-way diff for an unmerged path in this comparison."),
-            Line::raw(
-                "The COMBINED view (3) shows HEAD → working tree, including conflict markers.",
-            ),
-            Line::styled(
-                "Diffkit never modifies files; resolve the conflict in your editor.",
-                theme::muted(),
-            ),
-        ],
+        Notice::Unmerged(c) => conflict_lines(c),
         Notice::TooLarge { limit, size: s } => vec![
             Line::styled("File too large to display", theme::warning()),
             Line::raw(""),
@@ -212,7 +317,11 @@ fn notice_lines(v: &DiffView, notice: &Notice) -> Vec<Line<'static>> {
         ],
         Notice::NestedRepository => vec![
             Line::styled("Nested Git repository", theme::title()),
-            Line::styled("Its contents are not shown as a file.", theme::muted()),
+            Line::raw("This untracked directory is a separate Git repository."),
+            Line::styled(
+                "Its contents are not inspected; open Diffkit inside it to see them.",
+                theme::muted(),
+            ),
         ],
         Notice::NoTextChanges => {
             let f = &v.file;
@@ -252,7 +361,7 @@ fn view(frame: &mut Frame, app: &App, v: &DiffView, area: Rect, inner: Rect) {
             rows, number_width, ..
         } => (rows, number_width),
         Body::Notice(n) => {
-            message(frame, below, notice_lines(v, n));
+            message(frame, below, notice_lines(app, v, n));
             return;
         }
     };
@@ -277,7 +386,7 @@ fn view(frame: &mut Frame, app: &App, v: &DiffView, area: Rect, inner: Rect) {
             return;
         }
     };
-    let (old_label, new_label) = theme::side_labels(app.mode());
+    let (old_label, new_label) = app.side_labels();
     let labels = Line::from(vec![
         Span::raw(" ".repeat(a.old_gutter.width as usize)),
         Span::styled(old_label, theme::title()),

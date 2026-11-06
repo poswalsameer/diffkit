@@ -38,10 +38,13 @@ fn title(c: DiffComparison) -> &'static str {
         DiffComparison::Unstaged => "UNSTAGED",
         DiffComparison::Combined => "COMBINED",
         DiffComparison::Untracked => "UNTRACKED",
+        DiffComparison::Commit => "COMMIT",
     }
 }
 
-fn section(out: &mut String, list: &DiffFileList, loaded: Option<&DiffCollection>) {
+/// One comparison's file list (and, when loaded, per-file results).
+/// Shared with `diffkit show`.
+pub fn section(out: &mut String, list: &DiffFileList, loaded: Option<&DiffCollection>) {
     let stats = list.line_stats();
     let _ = write!(
         out,
@@ -173,7 +176,10 @@ fn loaded_detail(d: &FileDiff) -> String {
             s.new_commit.as_ref().map_or("working tree", |c| c.as_str()),
             if s.new_dirty { " (dirty)" } else { "" }
         ),
-        DiffContent::Unmerged => "unmerged: no two-way diff".into(),
+        DiffContent::Unmerged(c) => match c.kind {
+            Some(k) => format!("unmerged ({}): no two-way diff", k.description()),
+            None => "unmerged: no two-way diff".into(),
+        },
         DiffContent::TooLarge { limit, .. } => format!("too large (limit {limit} bytes)"),
         DiffContent::Unreadable { reason } => format!("unreadable: {reason}"),
         DiffContent::NestedRepository => "nested repository".into(),

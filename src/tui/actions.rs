@@ -27,6 +27,9 @@ pub enum Action {
     NextHunk,
     PreviousHunk,
     ToggleHelp,
+    ToggleDiagnostics,
+    /// Open or close the history screen (recent local commits).
+    ToggleHistory,
     CloseOverlay,
     ToggleSidebar,
     GrowSidebar,

@@ -1,7 +1,7 @@
 //! Structured diff data: discovered file metadata, loaded hunks, and rows
 //! ready for side-by-side presentation. No type here does I/O or display.
 
-use crate::git::models::{FileKind, ObjectId};
+use crate::git::models::{ConflictKind, ConflictStages, FileKind, ObjectId};
 use std::{path::Path, path::PathBuf, time::SystemTime};
 
 /// Which two states of the repository are compared.
@@ -15,6 +15,10 @@ pub enum DiffComparison {
     Combined,
     /// Files Git does not track and does not ignore, shown as additions.
     Untracked,
+    /// One commit against its first parent (or the empty tree for a root
+    /// commit): `git diff-tree <parent> <commit>`. Used by history
+    /// inspection; not one of the four working comparisons in [`Self::ALL`].
+    Commit,
 }
 
 impl DiffComparison {
@@ -31,13 +35,14 @@ impl DiffComparison {
             Self::Unstaged => "index -> working tree",
             Self::Combined => "HEAD -> working tree",
             Self::Untracked => "untracked -> working tree",
+            Self::Commit => "parent -> commit",
         }
     }
 
     /// The new side is read from the working tree (and can change at any
     /// moment), rather than from an object in the repository.
     pub fn new_side_is_working_tree(self) -> bool {
-        !matches!(self, Self::Staged)
+        !matches!(self, Self::Staged | Self::Commit)
     }
 }
 
@@ -166,9 +171,12 @@ impl DiffFile {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiffFileList {
     pub comparison: DiffComparison,
-    /// The commit (or, for an unborn HEAD, the empty tree) used as HEAD.
+    /// The commit (or, for an unborn HEAD, the empty tree) used as HEAD;
+    /// for [`DiffComparison::Commit`], the first parent (or the empty tree).
     /// `None` for comparisons that do not involve HEAD.
     pub base: Option<ObjectId>,
+    /// The commit being inspected ([`DiffComparison::Commit`] only).
+    pub target: Option<ObjectId>,
     pub files: Vec<DiffFile>,
     /// Working-tree files Git listed because their file-system metadata
     /// changed, but whose content is unchanged; they are not in `files`.
@@ -288,12 +296,45 @@ pub struct BinarySummary {
     pub new_size: Option<u64>,
 }
 
+/// What is on disk where a submodule should be, checked with `lstat` only.
+/// Diffkit never looks inside a submodule beyond whether it has a `.git`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubmoduleWorktree {
+    /// The directory exists and has a `.git` (the submodule is checked out).
+    Populated,
+    /// The directory exists without a `.git`: the submodule was never
+    /// initialized (`git submodule update` has not run).
+    NotInitialized,
+    /// Nothing exists at the path.
+    Missing,
+    /// Something other than a directory exists at the path.
+    NotADirectory,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubmoduleChange {
     pub old_commit: Option<ObjectId>,
     pub new_commit: Option<ObjectId>,
     /// Git reported the submodule's working tree as dirty (`-dirty`).
     pub new_dirty: bool,
+    /// The submodule directory in the working tree; `None` for commit
+    /// inspection, where the working tree is irrelevant.
+    pub worktree: Option<SubmoduleWorktree>,
+}
+
+/// An unmerged path. Git provides no two-way diff for it, so Diffkit shows
+/// what Git recorded: which index stages exist and whether a working-tree
+/// file (usually holding conflict markers) is present.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConflictInfo {
+    /// Git's classification (`UU`, `AA`, `DU`, …), when known.
+    pub kind: Option<ConflictKind>,
+    /// Base, ours, and theirs, as `git status` reported them at discovery.
+    /// `None` when the stages were not available (the engine was not built
+    /// from a status snapshot that listed this path).
+    pub stages: Option<ConflictStages>,
+    /// A file (or symlink) exists at the path in the working tree.
+    pub worktree_present: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -306,7 +347,7 @@ pub enum DiffContent {
     Binary(BinarySummary),
     Submodule(SubmoduleChange),
     /// A merge conflict. Git provides no two-way diff for this comparison.
-    Unmerged,
+    Unmerged(ConflictInfo),
     /// Content exceeded the configured limit; nothing partial is returned.
     TooLarge {
         limit: u64,

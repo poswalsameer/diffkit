@@ -9,7 +9,15 @@ tags, create or delete branches, or intentionally modify `.git/index`.
 
 `diffkit inspect` runs exactly three Git subcommands: `rev-parse`, `status`,
 and `for-each-ref`. The Phase 2 diff engine adds four read-only ones:
-`diff-index`, `diff-files`, `ls-files`, and `cat-file`. Porcelain `git diff`
+`diff-index`, `diff-files`, `ls-files`, and `cat-file`. Phase 4
+synchronization adds `check-ignore`, the only command run without
+`GIT_LITERAL_PATHSPECS` (it rejects that variable). Its paths are prefixed
+with `./`, so pathspec magic cannot apply. Phase 5 history inspection adds
+`log` (with `--no-show-signature --no-notes --no-mailmap --no-color` and an
+explicit format) and `diff-tree -r <parent> <commit>` (with the same
+`--no-ext-diff --no-textconv` options as the other diff commands).
+User-supplied revisions go through `rev-parse --verify --end-of-options`,
+so a revision starting with `-` is never read as an option. Porcelain `git diff`
 is deliberately not used, because it rewrites `.git/index` after
 working-tree comparisons even with `GIT_OPTIONAL_LOCKS=0`. Every invocation
 sets:
@@ -30,13 +38,32 @@ configured external diff programs and textconv filters never run
 (`tests/diff_read_only.rs` proves it with a positive control).
 
 Adding any other Git subcommand requires review, and the allow-lists in
-`tests/read_only.rs` and `tests/diff_read_only.rs` must be updated
-deliberately.
+`tests/read_only.rs`, `tests/diff_read_only.rs`, `tests/history.rs`
+(`diffkit show`), and `tests/tui_cli.rs` (the running viewer) must be
+updated deliberately.
 
 ## Git CLI is the source of truth
 
 Do not read `.git/HEAD`, refs, or the index directly; ask Git. Do not
 re-implement `.gitignore`, worktree, or ref resolution.
+
+Two narrow exceptions, both in the per-worktree Git directory that
+`rev-parse --absolute-git-dir` reports:
+
+- **Operations in progress** (`git::state`). Git offers no machine-readable
+  command for "a rebase is in progress". Porcelain v2 status omits it, and
+  the long format is localized. Diffkit checks for the same state files
+  `git status` and Git's own `git-prompt.sh` check: `MERGE_HEAD`,
+  `rebase-merge/`, `rebase-apply/`, `CHERRY_PICK_HEAD`, `REVERT_HEAD`,
+  `sequencer/todo`, and `BISECT_LOG`. It reads only a few small values
+  from them (step numbers, branch name, onto commit, bisect start), capped
+  at 4 KiB each.
+- **The reconciliation consistency guard** (`sync::reconcile`). It records
+  the metadata (size, mtime, inode) of the index, the current branch's
+  ref, `packed-refs`, `reftable/tables.list`, and the operation state
+  files, plus the content of `HEAD`. It compares them before and after
+  reading. These values decide only whether to read again; nothing shown
+  comes from them.
 
 ## No shell, no interpolation
 
@@ -58,6 +85,33 @@ interface uses `ratatui`, `crossterm`, and `unicode-width` (see
 `TECH_STACK.md`). Adding any other dependency requires explicit approval
 stating its name, purpose, why std is insufficient, its cost, and the
 feature that needs it.
+
+## Commit inspection (Phase 5)
+
+- History is local and bounded: at most 200 commits from HEAD in one
+  `git log`, whose output is capped at 32 MiB.
+- Commit diffs reuse the Phase 2 discovery, parser, alignment, and
+  staleness checks through `DiffComparison::Commit`. A merge is compared
+  with its first parent only. A shallow-boundary commit is not diffed
+  against the empty tree, because that would show every file as added.
+- Commit messages, names, e-mails, and revisions typed by the user are
+  untrusted text: escape them before display, including in error messages.
+
+## Synchronization (Phase 4)
+
+- Filesystem events are hints. Published state always comes from Git
+  through the Phase 1 and Phase 2 APIs; never from accumulated events.
+- Queues are bounded. Pending changes are a fixed-size bit set. One
+  reconciliation runs at a time, on one worker thread per repository.
+  There is no polling and no Git process per event.
+- The worker owns the watcher. The interface thread only applies finished
+  results, all at once.
+- A result read while Git was changing the index, HEAD, or refs is not
+  published (`Reconciled::settled`). Prefer showing the last consistent
+  state over a mixed one.
+- Repository-configured helpers can still run inside Git while state is
+  read: clean/smudge filters (for example Git LFS) and `core.fsmonitor`
+  hooks. External diff and textconv are disabled. Do not claim more.
 
 ## Terminal interface (Phase 3)
 

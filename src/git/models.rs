@@ -295,6 +295,55 @@ impl ConflictKind {
     }
 }
 
+/// One index stage of an unmerged path: the file as it was in the merge
+/// base (stage 1), on our side (stage 2), or on their side (stage 3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConflictStage {
+    /// Octal mode, for example `0o100644`.
+    pub mode: u32,
+    pub oid: ObjectId,
+}
+
+impl ConflictStage {
+    pub fn kind(&self) -> Option<FileKind> {
+        FileKind::from_mode(self.mode)
+    }
+}
+
+/// The index stages Git recorded for an unmerged path. A stage is `None`
+/// when that side has no version of the file (for example, `base` in an
+/// add/add conflict, or `theirs` when they deleted it).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ConflictStages {
+    pub base: Option<ConflictStage>,
+    pub ours: Option<ConflictStage>,
+    pub theirs: Option<ConflictStage>,
+}
+
+impl ConflictStages {
+    /// The conflict kind implied by which stages exist, using the same
+    /// mapping as Git's status (`DD` = base only, … `UU` = all three).
+    pub fn kind(&self) -> Option<ConflictKind> {
+        use ConflictKind::*;
+        Some(
+            match (
+                self.base.is_some(),
+                self.ours.is_some(),
+                self.theirs.is_some(),
+            ) {
+                (true, false, false) => BothDeleted,
+                (false, true, false) => AddedByUs,
+                (true, true, false) => DeletedByThem,
+                (false, false, true) => AddedByThem,
+                (true, false, true) => DeletedByUs,
+                (false, true, true) => BothAdded,
+                (true, true, true) => BothModified,
+                (false, false, false) => return None,
+            },
+        )
+    }
+}
+
 /// Object type derived from a porcelain v2 octal mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileKind {
@@ -346,6 +395,8 @@ pub struct FileStatus {
     /// `None` for untracked files (porcelain does not report a mode).
     pub file_kind: Option<FileKind>,
     pub submodule: Option<SubmoduleState>,
+    /// Index stages of an unmerged path (`u` records only).
+    pub stages: Option<ConflictStages>,
 }
 
 impl FileStatus {
@@ -436,6 +487,50 @@ impl RepositoryStatus {
     }
 }
 
+/// How a rebase in progress is being run.
+///
+/// Since Git 2.26, `git rebase` and `git rebase -i` both use the sequencer
+/// ("merge") backend and leave identical state files (Git's own status
+/// calls both "interactive rebase in progress"), so they are not told
+/// apart here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RebaseBackend {
+    /// The sequencer backend (`rebase-merge/`): `git rebase`, `git rebase -i`.
+    Merge,
+    /// The patch-based backend (`rebase-apply/`): `git rebase --apply`.
+    Apply,
+}
+
+/// A multi-step Git operation that has started and not yet finished in
+/// this worktree. Detected from the state files Git keeps in the
+/// per-worktree Git directory, the same files `git status` reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Operation {
+    /// `MERGE_HEAD` exists.
+    Merge,
+    Rebase {
+        backend: RebaseBackend,
+        /// (current step, total steps), when Git recorded them.
+        step: Option<(u64, u64)>,
+        /// The branch being rebased, as Git recorded it (for example
+        /// `refs/heads/feature`), or `None` for a detached rebase.
+        branch: Option<String>,
+        /// The commit being rebased onto.
+        onto: Option<ObjectId>,
+    },
+    /// `git am` is applying patches from a mailbox.
+    ApplyMailbox { step: Option<(u64, u64)> },
+    /// `CHERRY_PICK_HEAD` exists, or a cherry-pick sequence is in progress.
+    CherryPick,
+    /// `REVERT_HEAD` exists, or a revert sequence is in progress.
+    Revert,
+    /// `git bisect` has been started.
+    Bisect {
+        /// What bisect will return to (`BISECT_START`), usually a branch.
+        start: Option<String>,
+    },
+}
+
 /// Everything Phase 1 knows about a repository, collected in one pass.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepositorySnapshot {
@@ -444,6 +539,9 @@ pub struct RepositorySnapshot {
     pub upstream: UpstreamInfo,
     pub commit_tracking: CommitTrackingInfo,
     pub status: RepositoryStatus,
+    /// Operations in progress (merge, rebase, cherry-pick, revert, bisect),
+    /// in that order. Empty when none is.
+    pub operations: Vec<Operation>,
 }
 
 #[cfg(test)]
@@ -471,6 +569,7 @@ mod tests {
             similarity: None,
             file_kind: Some(FileKind::Regular),
             submodule: None,
+            stages: None,
         }
     }
 
@@ -564,5 +663,33 @@ mod tests {
         assert_eq!(ConflictKind::from_xy(*b"MM"), None);
         assert_eq!(FileKind::from_mode(0o120000), Some(FileKind::Symlink));
         assert_eq!(FileKind::from_mode(0), None);
+    }
+
+    #[test]
+    fn conflict_kind_follows_the_stages_present() {
+        let stage = || {
+            Some(ConflictStage {
+                mode: 0o100644,
+                oid: ObjectId::parse(&[b'a'; 40]).unwrap(),
+            })
+        };
+        let s = |b: bool, o: bool, t: bool| ConflictStages {
+            base: b.then(stage).flatten(),
+            ours: o.then(stage).flatten(),
+            theirs: t.then(stage).flatten(),
+        };
+        let cases = [
+            (s(true, false, false), b"DD"),
+            (s(false, true, false), b"AU"),
+            (s(true, true, false), b"UD"),
+            (s(false, false, true), b"UA"),
+            (s(true, false, true), b"DU"),
+            (s(false, true, true), b"AA"),
+            (s(true, true, true), b"UU"),
+        ];
+        for (stages, xy) in cases {
+            assert_eq!(stages.kind(), ConflictKind::from_xy(*xy), "{xy:?}");
+        }
+        assert_eq!(s(false, false, false).kind(), None);
     }
 }

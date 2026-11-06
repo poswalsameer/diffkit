@@ -89,6 +89,24 @@ pub fn output<S: AsRef<OsStr>>(dir: &Path, args: &[S]) -> Result<GitOutput> {
     })
 }
 
+/// Like [`output`], but without `GIT_LITERAL_PATHSPECS`. Only for commands
+/// that reject it (`git check-ignore`). The caller must neutralize pathspec
+/// magic itself, for example by prefixing each path with `./`.
+pub fn output_without_literal_pathspecs<S: AsRef<OsStr>>(
+    dir: &Path,
+    args: &[S],
+) -> Result<GitOutput> {
+    let out = command(dir, args)
+        .env_remove("GIT_LITERAL_PATHSPECS")
+        .output()
+        .map_err(spawn_error)?;
+    Ok(GitOutput {
+        status: out.status,
+        stdout: out.stdout,
+        stderr: out.stderr,
+    })
+}
+
 /// Like [`output`], but stops reading once stdout exceeds `limit` bytes,
 /// kills Git, and reports [`LimitedOutput::Exceeded`] instead of returning
 /// a truncated result. Stderr is drained on a scoped thread that is joined

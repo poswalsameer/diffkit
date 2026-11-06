@@ -46,6 +46,15 @@ pub const KEYS: &[(&str, &[(&str, &str)])] = &[
         ],
     ),
     (
+        "History (local commits only)",
+        &[
+            ("L", "open / close recent history"),
+            ("Enter", "list a commit's files / reload a file"),
+            ("Esc", "commit → history → working tree"),
+            ("r", "reload the history list"),
+        ],
+    ),
+    (
         "Layout",
         &[
             ("b", "show / hide the file list"),
@@ -55,7 +64,8 @@ pub const KEYS: &[(&str, &[(&str, &str)])] = &[
     (
         "General",
         &[
-            ("r", "refresh from Git (re-reads everything)"),
+            ("r", "refresh now (same pipeline as automatic sync)"),
+            ("D", "synchronization and cache diagnostics"),
             ("?", "toggle this help"),
             ("Esc", "close overlay / clear message"),
             ("q / Ctrl+C", "quit"),
@@ -78,6 +88,7 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
     match app.overlay() {
         None => {}
         Some(Overlay::Help) => help(frame, area),
+        Some(Overlay::Diagnostics) => diagnostics(frame, app, area),
         Some(Overlay::Error { title, message }) => {
             let rect = centered(area, 70, 9);
             frame.render_widget(Clear, rect);
@@ -114,11 +125,115 @@ fn help(frame: &mut Frame, area: Rect) {
         theme::muted(),
     ));
     lines.push(Line::styled(
-        "Upstream counts use local refs and may be stale.",
+        "↑/↓ compare with the upstream as last fetched; Diffkit never fetches.",
         theme::muted(),
     ));
     let rect = centered(area, 72, lines.len() as u16 + 2);
     frame.render_widget(Clear, rect);
     let block = Block::bordered().title(Span::styled(" Help — ? or Esc to close ", theme::title()));
+    frame.render_widget(Paragraph::new(lines).block(block), rect);
+}
+
+fn diagnostics(frame: &mut Frame, app: &App, area: Rect) {
+    let d = app.sync_state().diagnostics;
+    let c = app.cache_stats();
+    let ms = |t: Option<std::time::Duration>| {
+        t.map_or("—".to_string(), |t| format!("{} ms", t.as_millis()))
+    };
+    let mean = if d.reconciles_completed + d.reconcile_failures > 0 {
+        Some(d.total_reconcile / (d.reconciles_completed + d.reconcile_failures) as u32)
+    } else {
+        None
+    };
+    let kib = |b: usize| format!("{:.1} MiB", b as f64 / (1 << 20) as f64);
+    let rows: Vec<(String, String)> = vec![
+        ("Synchronization".into(), String::new()),
+        (
+            "  watcher".into(),
+            match (
+                &app.sync_state().watching,
+                &app.sync_state().watcher_message,
+            ) {
+                (Some(true), _) => "watching".into(),
+                (_, Some(m)) => escape_text(m),
+                _ => "not started (manual refresh only)".into(),
+            },
+        ),
+        ("  filesystem events".into(), d.fs_events.to_string()),
+        (
+            "  relevant / coalesced".into(),
+            format!("{} / {}", d.relevant_events, d.coalesced_events),
+        ),
+        (
+            "  queue overflows (dropped)".into(),
+            format!("{} ({})", d.overflows, d.dropped_events),
+        ),
+        (
+            "  reconciliations requested".into(),
+            d.reconcile_requests.to_string(),
+        ),
+        (
+            "  completed / unchanged / failed".into(),
+            format!(
+                "{} / {} / {}",
+                d.reconciles_completed, d.reconciles_unchanged, d.reconcile_failures
+            ),
+        ),
+        (
+            "  last / mean duration".into(),
+            format!("{} / {}", ms(d.last_reconcile), ms(mean)),
+        ),
+        ("  lists reused".into(), d.lists_reused.to_string()),
+        (
+            "  restarted / withheld (Git moving)".into(),
+            format!("{} / {}", d.reconcile_retries, d.reconciles_withheld),
+        ),
+        (
+            "  Git processes (sync worker)".into(),
+            d.git_calls.to_string(),
+        ),
+        (
+            "  watcher errors / restarts".into(),
+            format!("{} / {}", d.watcher_errors, d.watcher_restarts),
+        ),
+        ("Diff cache".into(), String::new()),
+        ("  entries".into(), c.entries.to_string()),
+        (
+            "  approx. memory (peak) / budget".into(),
+            format!(
+                "{} ({}) / {}",
+                kib(c.bytes),
+                kib(c.peak_bytes),
+                kib(c.budget_bytes)
+            ),
+        ),
+        (
+            "  hits / misses".into(),
+            format!("{} / {}", c.hits, c.misses),
+        ),
+        (
+            "  evictions / invalidations".into(),
+            format!("{} / {}", c.evictions, c.invalidations),
+        ),
+    ];
+    let lines: Vec<Line> = rows
+        .into_iter()
+        .map(|(k, v)| {
+            if v.is_empty() {
+                Line::styled(k, theme::accent().patch(theme::title()))
+            } else {
+                Line::from(vec![
+                    Span::styled(format!("{k:<34}"), theme::muted()),
+                    Span::raw(v),
+                ])
+            }
+        })
+        .collect();
+    let rect = centered(area, 70, lines.len() as u16 + 2);
+    frame.render_widget(Clear, rect);
+    let block = Block::bordered().title(Span::styled(
+        " Diagnostics — D or Esc to close ",
+        theme::title(),
+    ));
     frame.render_widget(Paragraph::new(lines).block(block), rect);
 }

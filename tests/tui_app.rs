@@ -342,7 +342,13 @@ fn refresh_keeps_selection_by_identity() {
     );
     assert_eq!(app.mode_state(DiffComparison::Unstaged).selected, 3);
     assert!(rows(&app).iter().any(|r| r.4 == "c.txt line three"));
-    assert_eq!(app.cached_entries(), 1, "cache rebuilt from scratch");
+    // Phase 4: refresh revalidates the cache against Git instead of
+    // clearing it. a, b, and c are unchanged, so their diffs stay cached.
+    assert_eq!(
+        app.cached_entries(),
+        3,
+        "unchanged files keep their cached diffs"
+    );
 }
 
 #[test]
@@ -513,7 +519,7 @@ fn full_flow_over_every_kind_of_change() {
                     if let Body::Notice(diffkit::tui::diff_view::Notice::Binary(_)) = v.body {
                         assert!(text.contains("Binary file — content preview unavailable."));
                     }
-                    if let Body::Notice(diffkit::tui::diff_view::Notice::Unmerged) = v.body {
+                    if let Body::Notice(diffkit::tui::diff_view::Notice::Unmerged(_)) = v.body {
                         assert!(text.contains("CONFLICT"), "{text}");
                     }
                 }

@@ -191,3 +191,199 @@ and without a terminal exits 1 with a message. The `--help`, `-h`, and
 `--version` assertions are unchanged.
 
 Benchmarks: `examples/bench_tui.rs`.
+
+## Phase 4: synchronization tests
+
+- **Unit tests (`src/sync/**`):**
+  - `events`: set operations.
+  - `classifier` (7 tests): working-tree create, modify, remove, rename,
+    and atomic replace; reads ignored; every Git metadata class; objects,
+    logs, hooks, and FETCH_HEAD ignored; Git-ignored and nested-repository
+    paths ignored, but a `target` that is not ignored is kept; linked
+    worktree metadata (own vs main worktree's); rescan becomes OVERFLOW;
+    root removal becomes STRUCTURE.
+  - `debounce` (6 tests, deterministic clock): single event, duplicates and
+    bursts, continuous activity firing at the maximum delay, empty input,
+    forced take, maximum ≥ quiet.
+  - `cache` (6 tests): hits, misses, LRU, budget with the protected entry,
+    targeted revalidation, rename and comparison identity, full
+    invalidation, size accounting.
+  - `watcher`: a full queue counts drops and never blocks; watch plans for
+    standard and linked repositories.
+  - `reconcile`: reuse rules.
+- **`tests/sync_scheduler.rs` (8, scripted reconciler, no watcher):**
+  - One run for a 100-event burst (99 coalesced).
+  - Events during a run are kept and the next run includes them; never two
+    runs at once.
+  - Manual refresh skips the debounce.
+  - The maximum delay prevents starvation.
+  - A failure is reported with no retry loop.
+  - Dropped events force a full OVERFLOW run.
+  - Shutdown during the debounce is prompt; shutdown never hangs on a busy
+    worker.
+- **`tests/sync_reconcile.rs` (5, real Git):**
+  - A refs-only change reuses all four lists (2 Git calls).
+  - A working-tree change reuses only Staged.
+  - A moved HEAD never reuses.
+  - INDEX, MANUAL, and OVERFLOW rediscover.
+  - Ignored directories: only directories that are themselves ignored,
+    including a pathspec-magic-looking name.
+- **`tests/sync_watch.rs` (11, real watcher + Git):**
+  - Editing; staging and unstaging; untracked files appearing and
+    disappearing; deletion and rename.
+  - External commit and branch switch; conflict introduced and resolved.
+  - A 100-write burst gives ≤ 3 reconciliations.
+  - Ignored build output and idle Git reads cause no reconciliation.
+  - Repository removal degrades without crashing.
+  - Linked worktree: its tree, its HEAD, and a shared ref moved from the
+    main worktree.
+  - `.git` stays byte-for-byte unchanged while syncing.
+- **`tests/tui_sync.rs` (10):**
+  - Unrelated changes keep the selection and cached diffs (1
+    invalidation; 0 Git calls to show the kept file).
+  - The viewed file changing reloads it and keeps the scroll position.
+  - A vanished selection moves to the nearest file with a notice.
+  - The header follows branch switches.
+  - Every indicator state; degraded mode keeps manual refresh through the
+    worker; `--no-watch` label.
+  - Cache budget evicts but protects the shown diff, and reloads.
+  - Diagnostics overlay.
+  - The interface stays responsive (200 actions and frames) while a
+    reconciliation is blocked.
+- **`tests/tui_cli.rs` (+2 real-PTY sessions):**
+  - An external edit and a new file appear without `r`; `Synced` shown;
+    the terminal is restored; exit within 3 s.
+  - A Git audit of the running viewer (edits, an external `git add`, `r`):
+    only allowed read-only subcommands, `GIT_OPTIONAL_LOCKS=0` on every
+    call.
+
+Changed Phase 3 assertion: `tui_app::refresh_keeps_selection_by_identity`
+expected refresh to clear the cache. It now expects unchanged files to keep
+their cached diffs, which is Phase 4's targeted invalidation.
+
+Timing: debounce logic is tested with injected instants. Thread and
+watcher tests wait for conditions with generous deadlines (5–15 s) rather
+than fixed sleeps. `sync_scheduler` and `sync_watch` were each run 6 times
+in a row without failure.
+
+Benchmarks: `examples/bench_sync.rs`.
+
+## Phase 5: advanced states, history, and release tests
+
+Every new behaviour is tested against real temporary repositories. New
+tests wrap inspection in `common::assert_read_only`, which fingerprints
+every file and symlink under the repository (`.git` included: index,
+refs, HEAD, objects, state files) before and after, and fails on any
+difference.
+
+- **Unit tests (12 new):**
+  - conflict-stage parsing (all stages, a malformed stage ID is an error);
+  - stage → conflict-kind mapping for all seven shapes;
+  - `git::state` (none, rebase with steps, apply vs `am`, merge,
+    cherry-pick, revert, bisect, sequencer, oversized or garbage files);
+  - `git log` record parsing (merges, multi-line messages, shallow
+    boundary, malformed records);
+  - commit-range arguments;
+  - bisect classification;
+  - the `inspect` report's operations and conflict stages.
+- **`tests/advanced_conflicts.rs` (5):**
+  - `UU`, `AA`, `UD`, and `DU` stages match `git ls-files --unmerged`
+    exactly;
+  - working-tree presence;
+  - conflicts versus ordinary edits;
+  - `inspect` stages;
+  - the interface's conflict panel.
+- **`tests/advanced_renames.rs` (5):**
+  - renames across directories, with and without edits, in Staged and
+    Combined;
+  - an unrelated delete + add is not a rename;
+  - unusual names (spaces, Unicode, a leading dash, pathspec magic, tab,
+    newline);
+  - renames in commits;
+  - a case-only rename on a case-insensitive file system.
+- **`tests/advanced_submodules.rs` (5):** moved submodule commit,
+  uninitialized submodule, missing directory, embedded repository
+  (gitlink without `.gitmodules`), untracked nested repository. Files
+  inside are never listed and the submodule is never initialized.
+- **`tests/advanced_symlinks.rs` (4, Unix):**
+  - target change;
+  - broken links, tracked and untracked;
+  - a link to a secret outside the repository (only the path is shown,
+    never the content);
+  - deletion and replacement by a regular file;
+  - a regular file holding a path-like string.
+- **`tests/repository_operations.rs` (11):**
+  - merge (and abort);
+  - rebase with the sequencer backend (step, branch, onto), interactive
+    rebase stopped by `exec`, and the apply backend;
+  - cherry-pick and revert;
+  - bisect;
+  - per-worktree isolation;
+  - detached and unborn HEAD;
+  - a `.git` file pointing nowhere, and an unreadable `.git` (Unix);
+  - the real watcher publishing operation changes.
+- **`tests/history.rs` (8):**
+  - commit metadata checked against Git (Unicode identities, explicit
+    dates);
+  - every change kind in a commit diff;
+  - root and merge commits;
+  - limit, order, and detached HEAD;
+  - shallow boundary;
+  - nine invalid revisions (empty, unknown, nonexistent hex, `-h`,
+    `--all`, out of range, a blob, a tree, a range) and four valid ones;
+  - `diffkit show` output, escaping, and exit codes;
+  - a logging-wrapper audit of every Git process `show` starts.
+- **`tests/tui_history.rs` (6):**
+  - inspect a commit and return to the identical working-tree view
+    (comparison, file, scroll);
+  - synchronization while history is open;
+  - comparison keys leave history;
+  - empty, merge, and shallow-boundary commits;
+  - escape sequences in messages and author names;
+  - tiny sizes and reload.
+- **`tests/tui_states.rs` (3):**
+  - bidi and zero-width characters in branch and file names never reach
+    a cell;
+  - hunk and scroll keys on notice-only views;
+  - very long names and subjects at widths 40–250.
+- **`tests/platform_paths.rs` (2):** a repository and a linked worktree
+  under directories with spaces, accents, CJK, and emoji, through the
+  interface, the CLI, and the real watcher.
+- **`tests/sync_consistency.rs` (1):** a stress test.
+  - A thread changes the index, HEAD, and refs in bursts while
+    reconciliations run.
+  - Every settled result must agree with itself (status versus each list,
+    and the base commit).
+  - Across five runs, every settled result was consistent, while 12 to 18
+    of the roughly 32 unsettled results per run were truly mixed. Those
+    are what the guard keeps from being published.
+- **`tests/sync_scheduler.rs` (+1):** an unsettled result is withheld and
+  followed by a full run.
+- **`tests/tui_cli.rs` (+2 real PTY sessions, 1 extended):**
+  - SIGTERM, SIGHUP, and SIGINT restore the terminal and exit with
+    128 + N within 3 s;
+  - a scripted history session;
+  - the Git audit of the running viewer now covers history (`log`,
+    `diff-tree`) and checks `--no-ext-diff`, `--no-textconv`, and
+    `--no-show-signature` in the arguments.
+
+Changed assertions in earlier tests (none weakened):
+- `diff_special_files::conflicts_are_explicit_in_staged_and_unstaged`
+  still requires no two-way diff, and now also requires the right kind,
+  all three stages, and working-tree presence.
+- `tui_app` matches `Notice::Unmerged(_)` instead of `Notice::Unmerged`.
+- `tui_render::header_shows_tracking_and_detached_states` expects the new
+  wording "(remote-tracking ref, as last fetched)".
+- `tui_cli::interactive_sync_runs_only_read_only_git_commands` gained
+  history steps, two allowed subcommands, and argument checks.
+
+PTY transcript matching: differential redraws leave unchanged cells
+unwritten, so text drawn over other text can have gaps. The history PTY
+test uses a tolerant matcher (a gap may stand for a character; at least
+75% must match exactly). It also asserts that a phrase never shown does
+not match.
+
+Repetition: the timing-sensitive tests were each run six times in a row
+without failure, after one flaky needle was fixed:
+- `sync_consistency`, `repository_operations`, `platform_paths`;
+- `tui_cli`, `sync_scheduler`, `tui_history`, `sync_watch`.

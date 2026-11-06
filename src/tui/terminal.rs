@@ -6,8 +6,27 @@
 //! restores the terminal before the panic message is printed, so the
 //! message is readable and the shell is usable afterwards. Mouse capture is
 //! never enabled, so the terminal's own text selection keeps working.
+//!
+//! Threads while the interface runs:
+//! - main: owns [`App`], renders, applies input and synchronization
+//!   results, and loads the selected diff;
+//! - input: reads terminal events (checking a stop flag every 200 ms);
+//! - sync worker ([`SyncService`]): watcher, debounce, reconciliation.
+//!
+//! Input and sync results arrive on one bounded channel, so the main thread
+//! sleeps until something happens; there is no polling or frame timer.
+//! On exit, the input thread is joined, the channel is dropped (so the
+//! worker cannot block sending), and the worker gets a bounded time to
+//! stop.
+//!
+//! On Unix, SIGTERM, SIGHUP, and SIGINT sent from outside (raw mode turns
+//! Ctrl+C into a key, so SIGINT only comes from `kill`) end the session the
+//! same way as `q`: the input thread notices within 200 ms and the loop
+//! returns, so the terminal is restored. A second signal while that is in
+//! progress exits immediately.
 
 use super::{actions::Action, app::App, keymap, ui};
+use crate::sync::{GitReconciler, SyncConfig, SyncEvent, SyncService};
 use crossterm::{
     cursor,
     event::{self, Event},
@@ -18,14 +37,47 @@ use ratatui::{backend::CrosstermBackend, layout::Rect, Terminal};
 use std::{
     io::{self, IsTerminal},
     path::Path,
-    sync::Once,
+    sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        mpsc::{self, Receiver, SyncSender},
+        Arc, Once,
+    },
+    thread::JoinHandle,
     time::Duration,
 };
+
+/// Interactive session options.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RunOptions {
+    /// Watch the filesystem and synchronize automatically.
+    pub watch: bool,
+}
+
+impl Default for RunOptions {
+    fn default() -> Self {
+        Self { watch: true }
+    }
+}
+
+/// Everything the main loop reacts to.
+enum LoopEvent {
+    Input(Event),
+    InputFailed(io::Error),
+    Sync(Box<SyncEvent>),
+    /// A termination signal arrived.
+    Signal(i32),
+}
+
+/// Capacity of the main loop's channel. Producers block when it is full;
+/// the main loop drains it completely on every iteration.
+const LOOP_QUEUE: usize = 256;
 
 #[derive(Debug)]
 pub enum TuiError {
     /// stdin or stdout is not a terminal.
     NoTerminal,
+    /// The session ended because of this signal; the terminal was restored.
+    Signal(i32),
     Git(crate::git::errors::GitError),
     Io(io::Error),
 }
@@ -38,6 +90,7 @@ impl std::fmt::Display for TuiError {
                 "the interactive interface needs a terminal (stdin and stdout must be a TTY); \
                  for plain output use `diffkit inspect` or `diffkit diff-stats`"
             ),
+            Self::Signal(n) => write!(f, "stopped by signal {n}"),
             Self::Git(e) => e.fmt(f),
             Self::Io(e) => write!(f, "terminal error: {e}"),
         }
@@ -120,23 +173,101 @@ impl Drop for TerminalGuard {
 /// Runs the interactive interface for the repository containing `start`.
 /// The repository is inspected before the terminal is touched, so errors
 /// such as "not a Git repository" print normally.
-pub fn run(start: &Path) -> Result<(), TuiError> {
+pub fn run(start: &Path, options: RunOptions) -> Result<(), TuiError> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         return Err(TuiError::NoTerminal);
     }
     let (w, h) = terminal::size()?;
     let mut app = App::open(start, Rect::new(0, 0, w, h))?;
+    let (tx, rx) = mpsc::sync_channel::<LoopEvent>(LOOP_QUEUE);
+    let config = SyncConfig {
+        watch: options.watch,
+        ..SyncConfig::default()
+    };
+    let reconciler = GitReconciler::new(
+        app.start_path().to_path_buf(),
+        app.options(),
+        app.reconciled(),
+    );
+    let sync_tx = tx.clone();
+    let sync = SyncService::start(config, reconciler, move |e| {
+        // Fails only after the main loop has ended.
+        let _ = sync_tx.send(LoopEvent::Sync(Box::new(e)));
+    });
+    app.set_background_sync(true);
+    let signals = Signals::register()?;
     let guard = TerminalGuard::enter()?;
-    let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
-    let result = event_loop(&mut terminal, &mut app);
-    drop(terminal);
+    let input = InputThread::start(tx, signals.received());
+    let result = Terminal::new(CrosstermBackend::new(io::stdout()))
+        .map_err(TuiError::from)
+        .and_then(|mut terminal| event_loop(&mut terminal, &mut app, &rx, &sync));
+    input.stop();
+    drop(rx);
+    sync.shutdown(Duration::from_secs(2));
     drop(guard);
+    drop(signals);
     result
+}
+
+/// Termination signals routed to the event loop while the interface runs.
+struct Signals {
+    /// The last signal received (0: none).
+    received: Arc<AtomicUsize>,
+    #[cfg(unix)]
+    ids: Vec<signal_hook::SigId>,
+}
+
+impl Signals {
+    #[cfg(unix)]
+    fn register() -> io::Result<Self> {
+        use signal_hook::{consts, flag};
+        let received = Arc::new(AtomicUsize::new(0));
+        let any = Arc::new(AtomicBool::new(false));
+        let mut ids = Vec::new();
+        for sig in [consts::SIGTERM, consts::SIGHUP, consts::SIGINT] {
+            // Registered first, so it sees `any` as it was before this
+            // signal: only a second signal exits at once.
+            ids.push(flag::register_conditional_shutdown(
+                sig,
+                128 + sig,
+                Arc::clone(&any),
+            )?);
+            ids.push(flag::register(sig, Arc::clone(&any))?);
+            ids.push(flag::register_usize(
+                sig,
+                Arc::clone(&received),
+                sig as usize,
+            )?);
+        }
+        Ok(Self { received, ids })
+    }
+
+    #[cfg(not(unix))]
+    fn register() -> io::Result<Self> {
+        Ok(Self {
+            received: Arc::new(AtomicUsize::new(0)),
+        })
+    }
+
+    fn received(&self) -> Arc<AtomicUsize> {
+        Arc::clone(&self.received)
+    }
+}
+
+impl Drop for Signals {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        for id in self.ids.drain(..) {
+            signal_hook::low_level::unregister(id);
+        }
+    }
 }
 
 fn event_loop<B: ratatui::backend::Backend>(
     terminal: &mut Terminal<B>,
     app: &mut App,
+    rx: &Receiver<LoopEvent>,
+    sync: &SyncService,
 ) -> Result<(), TuiError>
 where
     TuiError: From<B::Error>,
@@ -148,16 +279,75 @@ where
             app.load_pending();
         }
         terminal.draw(|f| ui::render(f, app))?;
-        handle(app, event::read()?);
-        // Apply all queued input before loading, so holding j does not load
-        // every file it passes.
-        while !app.should_quit() && event::poll(Duration::ZERO)? {
-            handle(app, event::read()?);
+        let Ok(first) = rx.recv() else { return Ok(()) };
+        handle_loop_event(app, first)?;
+        // Apply everything queued before loading, so holding j does not
+        // load every file it passes and bursts of updates render once.
+        while !app.should_quit() {
+            match rx.try_recv() {
+                Ok(e) => handle_loop_event(app, e)?,
+                Err(_) => break,
+            }
         }
         if app.should_quit() {
             return Ok(());
         }
+        if app.take_refresh_request() {
+            sync.request_refresh();
+        }
         app.load_pending();
+    }
+}
+
+fn handle_loop_event(app: &mut App, event: LoopEvent) -> Result<(), TuiError> {
+    match event {
+        LoopEvent::Input(e) => handle(app, e),
+        LoopEvent::Sync(e) => app.apply_sync(*e),
+        LoopEvent::InputFailed(e) => return Err(TuiError::Io(e)),
+        LoopEvent::Signal(n) => return Err(TuiError::Signal(n)),
+    }
+    Ok(())
+}
+
+/// Reads terminal events on its own thread so the main loop can also wait
+/// for synchronization results.
+struct InputThread {
+    stop: Arc<AtomicBool>,
+    handle: JoinHandle<()>,
+}
+
+impl InputThread {
+    fn start(tx: SyncSender<LoopEvent>, signal: Arc<AtomicUsize>) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&stop);
+        let handle = std::thread::Builder::new()
+            .name("diffkit-input".into())
+            .spawn(move || {
+                while !flag.load(Ordering::SeqCst) {
+                    let sig = signal.load(Ordering::SeqCst);
+                    if sig != 0 {
+                        let _ = tx.send(LoopEvent::Signal(sig as i32));
+                        return;
+                    }
+                    let event = match event::poll(Duration::from_millis(200)) {
+                        Ok(false) => continue,
+                        Ok(true) => event::read().map(LoopEvent::Input),
+                        Err(e) => Err(e),
+                    };
+                    let failed = event.is_err();
+                    let message = event.unwrap_or_else(LoopEvent::InputFailed);
+                    if tx.send(message).is_err() || failed {
+                        return;
+                    }
+                }
+            })
+            .expect("spawn input thread");
+        Self { stop, handle }
+    }
+
+    fn stop(self) {
+        self.stop.store(true, Ordering::SeqCst);
+        let _ = self.handle.join();
     }
 }
 

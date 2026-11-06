@@ -6,8 +6,8 @@
 
 use crate::{
     diff::{
-        BinarySummary, DiffContent, DiffFile, DiffLine, DiffRowKind, FileDiff, LineEnding,
-        SubmoduleChange,
+        BinarySummary, ConflictInfo, DiffContent, DiffFile, DiffLine, DiffRowKind, FileDiff,
+        LineEnding, SubmoduleChange,
     },
     display::{sanitize_content, Segment},
     git::models::ObjectId,
@@ -66,7 +66,7 @@ pub enum ViewRow {
 pub enum Notice {
     Binary(BinarySummary),
     Submodule(SubmoduleChange),
-    Unmerged,
+    Unmerged(ConflictInfo),
     TooLarge {
         limit: u64,
         size: Option<u64>,
@@ -100,6 +100,8 @@ pub struct DiffView {
     pub new_oid: Option<ObjectId>,
     pub added: usize,
     pub removed: usize,
+    /// Approximate heap and inline size, for the cache budget.
+    approx_bytes: usize,
 }
 
 impl DiffView {
@@ -147,11 +149,12 @@ impl DiffView {
             }
             DiffContent::Binary(b) => Body::Notice(Notice::Binary(b)),
             DiffContent::Submodule(s) => Body::Notice(Notice::Submodule(s)),
-            DiffContent::Unmerged => Body::Notice(Notice::Unmerged),
+            DiffContent::Unmerged(c) => Body::Notice(Notice::Unmerged(c)),
             DiffContent::TooLarge { limit, size } => Body::Notice(Notice::TooLarge { limit, size }),
             DiffContent::Unreadable { reason } => Body::Notice(Notice::Unreadable(reason)),
             DiffContent::NestedRepository => Body::Notice(Notice::NestedRepository),
         };
+        let approx_bytes = std::mem::size_of::<Self>() + body_bytes(&body);
         Self {
             file: diff.file,
             body,
@@ -159,7 +162,13 @@ impl DiffView {
             new_oid: diff.new_oid,
             added: stats.added as usize,
             removed: stats.removed as usize,
+            approx_bytes,
         }
+    }
+
+    /// Approximate memory held by this view: row structs plus text.
+    pub fn approx_bytes(&self) -> usize {
+        self.approx_bytes
     }
 
     pub fn row_count(&self) -> usize {
@@ -199,4 +208,28 @@ impl DiffView {
             Err(i) => Some(i - 1),
         }
     }
+}
+
+fn body_bytes(body: &Body) -> usize {
+    let Body::Rows {
+        rows, hunk_starts, ..
+    } = body
+    else {
+        return 0;
+    };
+    let cell = |c: &Option<Cell>| {
+        c.as_ref().map_or(0, |c| {
+            c.segments.capacity() * std::mem::size_of::<Segment>()
+                + c.segments.iter().map(|s| s.text.capacity()).sum::<usize>()
+        })
+    };
+    rows.capacity() * std::mem::size_of::<ViewRow>()
+        + hunk_starts.capacity() * std::mem::size_of::<usize>()
+        + rows
+            .iter()
+            .map(|r| match r {
+                ViewRow::Hunk { header, .. } => header.capacity(),
+                ViewRow::Line { old, new, .. } => cell(old) + cell(new),
+            })
+            .sum::<usize>()
 }

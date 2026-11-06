@@ -8,6 +8,7 @@ use diffkit::diff::{
     BinaryStatus, BinarySummary, DiffComparison::*, DiffContent, DiffRowKind::*, FileChangeKind,
     LineEnding,
 };
+use diffkit::git::models::ConflictKind;
 
 fn repo(label: &str) -> (TempDir, Repo) {
     let tmp = TempDir::new(label);
@@ -298,7 +299,13 @@ fn conflicts_are_explicit_in_staged_and_unstaged() {
             1
         );
         let d = e.load_file_diff(&list, f.id).unwrap();
-        assert_eq!(d.content, DiffContent::Unmerged, "no invented two-way diff");
+        let DiffContent::Unmerged(info) = &d.content else {
+            panic!("no invented two-way diff: {:?}", d.content);
+        };
+        assert_eq!(info.kind, Some(ConflictKind::BothModified));
+        let stages = info.stages.as_ref().expect("stages from git status");
+        assert!(stages.base.is_some() && stages.ours.is_some() && stages.theirs.is_some());
+        assert!(info.worktree_present);
         let all = e.load_all(&list).unwrap();
         assert!(
             all.unexpected_paths.is_empty(),

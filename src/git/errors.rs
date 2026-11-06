@@ -27,6 +27,9 @@ pub enum GitError {
         code: Option<i32>,
         stderr: String,
     },
+    /// A revision given by the user does not name a commit in the local
+    /// repository (unknown, malformed, or not a commit).
+    UnknownRevision { rev: String, detail: String },
     /// Git produced output that does not follow the documented format.
     MalformedOutput {
         context: &'static str,
@@ -78,6 +81,11 @@ impl fmt::Display for GitError {
                 }
                 Ok(())
             }
+            Self::UnknownRevision { rev, detail } => write!(
+                f,
+                "\"{}\" is not a commit: {detail}",
+                crate::display::escape_text(rev)
+            ),
             Self::MalformedOutput { context, detail } => {
                 write!(f, "unexpected Git output ({context}): {detail}")
             }

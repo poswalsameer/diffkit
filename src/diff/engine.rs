@@ -11,15 +11,20 @@
 //! again, and its result is checked against the discovered metadata. If the
 //! file changed in between, loading returns [`DiffError::Stale`] rather than
 //! attaching new content to old metadata.
+//!
+//! A commit is inspected the same way:
+//! [`DiffEngine::discover_commit`] lists its files against its first parent,
+//! and [`DiffEngine::load_file_diff`] loads one of them. Commits never
+//! change, so those lists cannot go stale.
 
 use super::{
     binary, commands, discovery,
     errors::{DiffError, Result, StaleReason},
     hunk,
     models::{
-        BinaryStatus, ContentSource, DiffCollection, DiffComparison, DiffContent, DiffFile,
-        DiffFileList, DiffOptions, FileChangeKind, FileDiff, FileId, LineStats, LoadedFile,
-        SubmoduleChange,
+        BinaryStatus, ConflictInfo, ContentSource, DiffCollection, DiffComparison, DiffContent,
+        DiffFile, DiffFileList, DiffOptions, FileChangeKind, FileDiff, FileId, LineStats,
+        LoadedFile, SubmoduleChange, SubmoduleWorktree,
     },
     parser::{self, FilePatch, Origin, PatchKind},
     untracked,
@@ -27,7 +32,7 @@ use super::{
 use crate::git::{
     self,
     commands::{path_bytes, LimitedOutput},
-    models::{ObjectFormat, ObjectId, RepositorySnapshot},
+    models::{ConflictKind, ConflictStages, ObjectFormat, ObjectId, RepositorySnapshot},
     snapshot,
 };
 use std::{
@@ -41,6 +46,8 @@ pub struct DiffEngine {
     head: Option<ObjectId>,
     object_format: ObjectFormat,
     conflicted: HashSet<PathBuf>,
+    /// Kind and index stages of each conflicted path, from the snapshot.
+    conflicts: HashMap<PathBuf, (Option<ConflictKind>, Option<ConflictStages>)>,
     options: DiffOptions,
 }
 
@@ -61,6 +68,13 @@ impl DiffEngine {
                 .iter()
                 .filter(|f| f.is_conflicted())
                 .map(|f| f.path.clone())
+                .collect(),
+            conflicts: s
+                .status
+                .files
+                .iter()
+                .filter(|f| f.is_conflicted())
+                .map(|f| (f.path.clone(), (f.conflict, f.stages.clone())))
                 .collect(),
             options,
         }
@@ -93,12 +107,24 @@ impl DiffEngine {
     }
 
     /// Lists changed files for one comparison without loading content.
+    /// [`DiffComparison::Commit`] needs a commit; use
+    /// [`DiffEngine::discover_commit`].
     pub fn discover(&self, comparison: DiffComparison) -> Result<DiffFileList> {
         let (base, files, stat_only_entries) = match comparison {
             DiffComparison::Untracked => (None, untracked::discover(&self.root)?, 0),
+            DiffComparison::Commit => {
+                return Err(DiffError::parse(
+                    0,
+                    "commit inspection needs a commit (use discover_commit)",
+                ))
+            }
             _ => {
                 let base = self.base();
-                let out = git::commands::run(&self.root, &commands::discovery(comparison, &base))?;
+                let range = commands::Range {
+                    base: &base,
+                    target: None,
+                };
+                let out = git::commands::run(&self.root, &commands::discovery(comparison, range))?;
                 let found = discovery::parse_raw_numstat(&out)?;
                 let files =
                     discovery::build_files(found.pairs, comparison, &self.root, &self.conflicted)?;
@@ -112,9 +138,55 @@ impl DiffEngine {
         Ok(DiffFileList {
             comparison,
             base,
+            target: None,
             files,
             stat_only_entries,
         })
+    }
+
+    /// Lists the files changed by `commit` against `first_parent` (the empty
+    /// tree when `None`, for a root commit). Merge commits are compared with
+    /// their first parent only. Metadata only; no content is loaded.
+    pub fn discover_commit(
+        &self,
+        commit: &ObjectId,
+        first_parent: Option<&ObjectId>,
+    ) -> Result<DiffFileList> {
+        let base = first_parent
+            .cloned()
+            .unwrap_or_else(|| self.object_format.empty_tree());
+        let range = commands::Range {
+            base: &base,
+            target: Some(commit),
+        };
+        let args = commands::discovery(DiffComparison::Commit, range);
+        let out = git::commands::run(&self.root, &args)?;
+        let found = discovery::parse_raw_numstat(&out)?;
+        let files = discovery::build_files(
+            found.pairs,
+            DiffComparison::Commit,
+            &self.root,
+            &HashSet::new(),
+        )?;
+        Ok(DiffFileList {
+            comparison: DiffComparison::Commit,
+            base: Some(base),
+            target: Some(commit.clone()),
+            files,
+            stat_only_entries: found.stat_only,
+        })
+    }
+
+    /// The trees a list compares. Working comparisons use the engine's
+    /// HEAD; a commit list carries its own parent and commit.
+    fn range_of(list: &DiffFileList, head: &ObjectId) -> (ObjectId, Option<ObjectId>) {
+        match list.comparison {
+            DiffComparison::Commit => (
+                list.base.clone().unwrap_or_else(|| head.clone()),
+                list.target.clone(),
+            ),
+            _ => (head.clone(), None),
+        }
     }
 
     /// Loads the diff of one discovered file.
@@ -124,7 +196,7 @@ impl DiffEngine {
             return untracked::load(&self.root, file, self.options.max_untracked_bytes);
         }
         if file.kind == FileChangeKind::Unmerged {
-            return Ok(unmerged(file));
+            return Ok(self.unmerged(file));
         }
         self.check_worktree(file)?;
         let mut paths: Vec<&Path> = file
@@ -134,8 +206,12 @@ impl DiffEngine {
             .map(PathBuf::as_path)
             .collect();
         paths.dedup();
-        let base = self.base();
-        let args = commands::patch(file.comparison, &base, self.options.context_lines, &paths);
+        let (base, target) = Self::range_of(list, &self.base());
+        let range = commands::Range {
+            base: &base,
+            target: target.as_ref(),
+        };
+        let args = commands::patch(file.comparison, range, self.options.context_lines, &paths);
         let out = match git::commands::output_limited(
             &self.root,
             &args,
@@ -178,8 +254,12 @@ impl DiffEngine {
         if list.comparison == DiffComparison::Untracked || list.is_empty() {
             return Ok(one_by_one(Vec::new()));
         }
-        let base = self.base();
-        let args = commands::patch(list.comparison, &base, self.options.context_lines, &[]);
+        let (base, target) = Self::range_of(list, &self.base());
+        let range = commands::Range {
+            base: &base,
+            target: target.as_ref(),
+        };
+        let args = commands::patch(list.comparison, range, self.options.context_lines, &[]);
         let out = match git::commands::output_limited(
             &self.root,
             &args,
@@ -214,7 +294,7 @@ impl DiffEngine {
                 }
             }
             let result = if file.kind == FileChangeKind::Unmerged {
-                Ok(unmerged(file))
+                Ok(self.unmerged(file))
             } else if missing {
                 Err(stale(file, StaleReason::MissingFromDiff))
             } else {
@@ -295,7 +375,11 @@ impl DiffEngine {
             .flatten()
             .any(|m| m.0 == 0o160000);
         let content = if submodule {
-            DiffContent::Submodule(submodule_change(file, &sections))
+            let mut change = submodule_change(file, &sections);
+            if file.comparison != DiffComparison::Commit {
+                change.worktree = Some(submodule_worktree(&self.root.join(file.path())));
+            }
+            DiffContent::Submodule(change)
         } else if is_binary {
             DiffContent::Binary(binary::summary(
                 &self.root,
@@ -332,13 +416,37 @@ fn stale(file: &DiffFile, reason: StaleReason) -> DiffError {
     }
 }
 
-fn unmerged(file: &DiffFile) -> FileDiff {
-    FileDiff {
-        file: file.clone(),
-        content: DiffContent::Unmerged,
-        source: ContentSource::Metadata,
-        old_oid: None,
-        new_oid: None,
+impl DiffEngine {
+    /// An unmerged path: the stages Git reported in the snapshot, and
+    /// whether the working-tree file exists. No Git process runs.
+    fn unmerged(&self, file: &DiffFile) -> FileDiff {
+        let path = file.path();
+        let (kind, stages) = self.conflicts.get(path).cloned().unwrap_or((None, None));
+        let info = ConflictInfo {
+            kind: kind.or_else(|| stages.as_ref().and_then(ConflictStages::kind)),
+            stages,
+            worktree_present: std::fs::symlink_metadata(self.root.join(path)).is_ok(),
+        };
+        FileDiff {
+            file: file.clone(),
+            content: DiffContent::Unmerged(info),
+            source: ContentSource::Metadata,
+            old_oid: None,
+            new_oid: None,
+        }
+    }
+}
+
+/// What exists at a submodule's path, without looking inside it beyond
+/// checking for `.git`.
+fn submodule_worktree(path: &Path) -> SubmoduleWorktree {
+    match std::fs::symlink_metadata(path) {
+        Err(_) => SubmoduleWorktree::Missing,
+        Ok(m) if !m.is_dir() => SubmoduleWorktree::NotADirectory,
+        Ok(_) if std::fs::symlink_metadata(path.join(".git")).is_ok() => {
+            SubmoduleWorktree::Populated
+        }
+        Ok(_) => SubmoduleWorktree::NotInitialized,
     }
 }
 
@@ -388,6 +496,7 @@ fn submodule_change(file: &DiffFile, sections: &[FilePatch]) -> SubmoduleChange 
         old_commit: file.old_oid.clone(),
         new_commit: file.new_oid.clone(),
         new_dirty,
+        worktree: None,
     }
 }
 

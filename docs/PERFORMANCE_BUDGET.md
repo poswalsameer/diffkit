@@ -212,3 +212,198 @@ file counts can be shown in the tab bar.
 
 Not measured: real terminal output time (depends on the emulator), memory
 of the interactive process, Linux, and Windows.
+
+## Phase 4: synchronization — 2026-11-06
+
+Machine: macOS (Darwin 25.5.0, Apple M5), Git 2.54.0, release build, FSEvents.
+
+```sh
+cargo run --release --example bench_sync -- 5
+```
+
+- Repositories of 100, 5,000, and 50,000 tracked files are generated under
+  `$TMPDIR/diffkit-bench-sync`.
+- Each scenario uses a real `SyncService`: a real watcher, quiet period
+  200 ms, maximum delay 1 s.
+- Each scenario gets 1 warm-up run and 5 measured runs; medians are shown.
+- Git processes are counted in-process: each `git` spawn increments a
+  thread-local counter on the sync worker.
+- **Latency** is measured from the end of the external change to the
+  published state, and includes the deliberate 200 ms quiet period.
+- **Events** are raw watcher callbacks. FSEvents reports several per
+  write.
+
+| Tracked | Scenario | Events | Reconciliations | Git processes | Reconcile time | Latency |
+|---:|---|---:|---:|---:|---:|---:|
+| 100 | one file saved | 4 | 1 | 5 | 42.7 ms | 258 ms |
+| 100 | 10 events, one file | 8 | 1 | 5 | 22.3 ms | 238 ms |
+| 100 | 100 events, 10 files | 424 | 1 | 5 | 45.9 ms | 250 ms |
+| 100 | 1,000-event burst | 4124 | 1 | 5 | 60.2 ms | 269 ms |
+| 100 | save every 50 ms for 3 s | 224 | 3 | 15 | 41.7 ms | 0 ms |
+| 100 | edit + git add (index) | 18 | 1 | 7 | 48.0 ms | 265 ms |
+| 100 | branch switch | 29 | 1 | 6 | 43.5 ms | 256 ms |
+| 100 | manual refresh (full reconciliation) | 0 | 1 | 7 | — | 53 ms |
+| 5000 | one file saved | 4 | 1 | 5 | 57.9 ms | 272 ms |
+| 5000 | 10 events, one file | 8 | 1 | 5 | 58.7 ms | 271 ms |
+| 5000 | 100 events, 10 files | 424 | 1 | 5 | 54.8 ms | 261 ms |
+| 5000 | 1,000-event burst | 4172 | 1 | 5 | 66.6 ms | 273 ms |
+| 5000 | save every 50 ms for 3 s | 224 | 3 | 15 | 59.1 ms | 0 ms |
+| 5000 | edit + git add (index) | 18 | 1 | 7 | 63.9 ms | 279 ms |
+| 5000 | branch switch | 29 | 1 | 6 | 66.0 ms | 278 ms |
+| 5000 | manual refresh (full reconciliation) | 0 | 1 | 7 | — | 69 ms |
+| 50000 | one file saved | 25 | 1 | 5 | 181.9 ms | 398 ms |
+| 50000 | 10 events, one file | 8 | 1 | 5 | 181.4 ms | 394 ms |
+| 50000 | 100 events, 10 files | 424 | 1 | 5 | 182.5 ms | 388 ms |
+| 50000 | 1,000-event burst | 4128 | 1 | 5 | 186.7 ms | 394 ms |
+| 50000 | save every 50 ms for 3 s | 224 | 3 | 15 | 182.1 ms | 0 ms |
+| 50000 | edit + git add (index) | 20 | 1 | 7 | 186.5 ms | 425 ms |
+| 50000 | branch switch | 29 | 1 | 6 | 184.5 ms | 396 ms |
+| 50000 | manual refresh (full reconciliation) | 0 | 1 | 7 | — | 210 ms |
+
+Reading the table:
+- Every burst, from 8 to over 4,000 watcher events, collapses into one
+  reconciliation of 5 Git processes. For working-tree triggers, only the
+  Staged list is reused.
+- "Save every 50 ms for 3 s": the quiet period never elapses, so the 1 s
+  maximum delay forces a run about once a second (3 runs). Its latency
+  column (0 ms) is not meaningful: the final state had already been
+  published by a maximum-delay run before the measurement began. Treat it
+  as not applicable.
+- Index and branch changes rediscover all lists: 6–7 Git processes.
+- Manual refresh skips the debounce. Its latency is the full
+  reconciliation time, including ignored-directory detection.
+- Reconciliation cost grows with repository size because `git status`
+  and the list commands scan the index: about 43 ms at 100 files, 58 ms at
+  5,000, and 182 ms at 50,000.
+
+Cache (5,000-file repository, 200 changed files, interface state
+in-process):
+
+| Scenario | Result |
+|---|---|
+| Two files, back and forth, 100 moves | 1 Git call; 99 hits / 2 misses (the misses include the first file loaded before counting) |
+| Walk 200 files, second pass, 64 MiB budget | 0 Git calls, 0.1 ms, 100% hits; 200 entries, 0.45 MiB |
+| Same walk, 256 KiB budget | second pass 200 Git calls; 289 evictions; peak 256 KiB; resident 254 KiB |
+| Reload of the shown file after it changed | 3.55 ms, 1 Git call, 1 invalidation |
+| One 200,000-line diff (16,000 display rows) | 6.83 MiB charged to the cache |
+
+Process memory for the whole benchmark run, from `/usr/bin/time -l`, is
+not a measurement of the interactive viewer:
+- maximum resident set size 65,339,392 bytes;
+- peak memory footprint 33,063,368 bytes;
+- 309.66 s real time.
+
+Not measured:
+- Linux (inotify) and Windows (ReadDirectoryChangesW);
+- network filesystems;
+- the memory of a long-running interactive session;
+- CPU use while idle (the input thread wakes every 200 ms; the sync
+  worker blocks).
+
+## Phase 5: release measurements — 2026-11-07
+
+Same machine: macOS 26.5 (arm64), Apple M5, Git 2.54.0, rustc 1.98.1. The
+release profile now uses LTO and one codegen unit (`Cargo.toml`), so all
+Phase 5 numbers are from that build.
+
+### New scenarios
+
+```sh
+cargo run --release --example bench_release -- 5
+```
+
+In-process; 5 measured runs after 1 warm-up (medians); frames rendered into
+a 200×60 `TestBackend`.
+
+#### 1,000 changed files (5,000 tracked)
+
+| Measure | Result |
+|---|---:|
+| App::open (snapshot + 4 lists) | 96.4 ms, 6 Git |
+| First frame | 0.18 ms |
+| First diff load | 3.84 ms, 1 Git |
+| Manual refresh (inline, full) | 96.3 ms, 6 Git |
+| Walk 1,000 files twice (first pass loads, second is cached) | 3606 ms |
+| Cache, 64 MiB budget | second pass 100.0% hits; 1000 entries, 0 evictions, peak 3.35 MiB |
+| Same walk, 256 KiB budget | 2000 misses, 2000 evictions |
+
+#### Burst: 1,000 writes to 1,000 files, real watcher
+
+Median: 2064 watcher events, 1 reconciliations, first result 341 ms after the last write.
+
+#### Three linked worktrees (5,000 tracked files)
+
+App::open of a linked worktree: 36.7 ms median over all three, 7 Git.
+A commit published to `main` from worktree 2 appears as "behind" in worktree 1: 242 ms median after the ref moved.
+
+#### History (1,001 commits)
+
+| Measure | Result |
+|---|---:|
+| List 200 recent commits (L) | 4.4 ms, 1 Git |
+| Open a commit (its file list) | 3.3 ms, 1 Git |
+| Load its first file | 3.5 ms, 1 Git |
+
+Notes:
+- The 1,000-file walk loads every file on the first pass (about 3.5 ms
+  each, one `git diff-files` per file). The second pass is answered
+  entirely from the cache.
+- With a 256 KiB budget, every move evicts and reloads.
+- "Burst": 1,000 writes produced 2,064 watcher events and one
+  reconciliation. The latency includes the 200 ms quiet period.
+- "Linked worktrees": a commit made in worktree 2 and published to the
+  shared `main` with `update-ref` appears in worktree 1 (whose upstream is
+  `main`) as "behind" 242 ms later (median).
+- Whole-process memory for `bench_release`, from `/usr/bin/time -l`:
+  - maximum resident set size 19,709,952 bytes;
+  - peak memory footprint 12,796,360 bytes;
+  - 111.5 s real time.
+
+### Phase 1 and Phase 3 benchmarks re-run unchanged
+
+`bench_tui -- 7` (Phase 3 method):
+
+| Tracked | Phase 3 `App::open` | Phase 5 `App::open` | Phase 3 first diff | Phase 5 first diff |
+|---:|---:|---:|---:|---:|
+| 100 | 26.66 ms | 19.70 ms | 3.92 ms | 3.25 ms |
+| 5,000 | 40.47 ms | 40.25 ms | 3.75 ms | 3.77 ms |
+| 50,000 | 306.81 ms | 305.87 ms | 5.84 ms | 6.07 ms |
+
+200,000-line file:
+- `load_file_diff`: 573.47 → 585.93 ms;
+- display rows: 7.94 → 8.81 ms;
+- one frame: 0.207 → 0.208 ms;
+- scroll + frame: 0.222 → 0.222 ms.
+
+The same 6 Git processes run at startup and 1 per diff, so operation
+detection and conflict stages added no Git process. Process memory for
+`bench_tui`: maximum RSS 67,747,840 bytes, peak footprint 31,457,712 bytes.
+
+`bench_inspect -- 15` (Phase 1 method, end-to-end `diffkit inspect`):
+
+| Repo | Scenario | Phase 1 median | Phase 5 median | `git status` then → now |
+|---|---|---:|---:|---:|
+| small | clean | 10.29 ms | 11.38 ms | 3.52 → 3.62 ms |
+| small | dirty | 10.32 ms | 11.55 ms | 3.56 → 3.76 ms |
+| medium | clean | 15.59 ms | 17.05 ms | 8.74 → 9.14 ms |
+| medium | dirty | 15.90 ms | 17.28 ms | 9.05 → 9.29 ms |
+| large | clean | 63.11 ms | 98.54 ms | 56.17 → 81.44 ms |
+| large | dirty | 66.06 ms | 67.66 ms | 58.37 → 58.99 ms |
+
+Reading the comparison:
+- **Large clean (+35 ms):** environmental. Plain `git status` slowed by
+  25 ms in the same run, and its individual runs ranged 93–126 ms (Phase
+  1: 62–64 ms).
+- **Small and medium (+1.1 to +1.5 ms):** not isolated.
+  - Git calls are unchanged (3).
+  - An interleaved A/B on the small repository, with the same code built
+    with and without LTO, gave 11.91 ms and 12.02 ms, with `git status` at
+    4.25 ms in that session (3.52 ms in Phase 1). So the release profile
+    is not the cause, and the machine was slower than during Phase 1.
+  - The only new work in `inspect` is about 10 `lstat` calls for
+    operation detection.
+  - It is reported as an unexplained difference of about 1 ms, not as a
+    measured regression.
+
+Not measured: Linux, Windows, or macOS Intel; a real terminal emulator's
+output time; idle CPU; long interactive sessions.

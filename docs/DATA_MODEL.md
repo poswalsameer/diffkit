@@ -227,3 +227,130 @@ StatsChanged, BinaryChanged, WorkingTreeChanged}`.
 
 Expected outcomes are `DiffContent` variants, not errors: binary, too large,
 unreadable, unmerged, and nested repository.
+
+# Phase 4 — Synchronization Models (`src/sync/`)
+
+## ChangeSet
+
+A `u16` bit set of change categories. It is the only form in which pending
+filesystem changes are stored, so its size never grows with event count.
+Categories:
+- WORKTREE, IGNORE_RULES, INDEX, HEAD, REFS, CONFIG
+- MERGE_STATE, REBASE_STATE, STRUCTURE
+- OVERFLOW (events lost or a rescan requested)
+- MANUAL (`r`), STARTUP
+
+## WatchLayout
+
+`WatchLayout { root, git_dir, common_dir, excluded }`:
+- `root` is the working tree.
+- `git_dir` is the per-worktree Git directory; `common_dir` the shared
+  one.
+- `excluded` lists untracked directories that are themselves ignored.
+
+## Reconciled
+
+`Reconciled { snapshot, lists, trigger, duration, reused }`:
+- `snapshot`: a Phase 1 `RepositorySnapshot`.
+- `lists`: one `Result<Arc<DiffFileList>, String>` per comparison, in
+  `Comparison::ALL` order. A failed list does not fail the others.
+- `trigger`: the `ChangeSet` that caused the run.
+- `reused`: how many lists were carried over unchanged.
+
+`same_state` compares snapshots and lists, ignoring timing and trigger.
+
+## SyncEvent and SyncUpdate
+
+`SyncEvent { update, diagnostics, pending }`. `pending` means changes
+arrived after the published state was read. `SyncUpdate` is one of:
+- `Watching { roots }`
+- `WatcherUnavailable(reason)`
+- `ChangesDetected`
+- `Synchronizing`
+- `Reconciled(Box<Reconciled>)`
+- `Unchanged`
+- `Failed(message)`
+
+## SyncDiagnostics
+
+Counters:
+- filesystem, relevant, coalesced, and dropped events, plus overflows;
+- reconcile requests, completions, unchanged results, and failures;
+- lists reused;
+- last and total reconcile time;
+- Git process count;
+- watcher errors and restarts.
+
+## DiffCache
+
+`DiffCache<V>` stores entries keyed by `CacheKey { comparison, old_path,
+new_path }`. Each entry keeps:
+- the `DiffFile` it was loaded from (its version);
+- the value;
+- an approximate byte size;
+- a recency stamp.
+
+Rules:
+- An entry is valid only while Git's fresh `DiffFile` for the same key is
+  identical, ignoring `FileId`.
+- One entry, the diff on screen, can be protected from eviction.
+
+`CacheStats` reports hits, misses, evictions, invalidations, entries,
+bytes, peak bytes, and the budget.
+
+# Phase 5 — States and History
+
+## Conflicts
+
+- `ConflictStage { mode, oid }` and `ConflictStages { base, ours, theirs }`
+  come from porcelain v2 `u` records. A stage is `None` when that side has
+  no version of the file.
+- `ConflictStages::kind` maps which stages exist to Git's code:
+  - base only = `DD`;
+  - ours only = `AU`;
+  - base + ours = `UD`;
+  - theirs only = `UA`;
+  - base + theirs = `DU`;
+  - ours + theirs = `AA`;
+  - all three = `UU`.
+- `FileStatus::stages` is `Some` for unmerged entries only.
+- `DiffContent::Unmerged(ConflictInfo { kind, stages, worktree_present })`.
+
+## Operations
+
+`RepositorySnapshot::operations: Vec<Operation>`, in this order:
+- `Merge`
+- `Rebase { backend, step, branch, onto }`, where `RebaseBackend` is
+  `Merge` (sequencer; also `-i`) or `Apply`
+- `ApplyMailbox { step }`
+- `CherryPick`
+- `Revert`
+- `Bisect { start }`
+
+An empty list means nothing is in progress.
+
+## Submodules
+
+`SubmoduleChange::worktree: Option<SubmoduleWorktree>` is one of:
+- `Populated`
+- `NotInitialized`
+- `Missing`
+- `NotADirectory`
+
+It is `None` in commit inspection.
+
+## History
+
+- `CommitInfo { id, short_id, parents, author, committer, message,
+  shallow_boundary }`, where `Signature { name, email, date }` and `date` is
+  strict ISO 8601 with the recorded offset.
+- `History { commits, truncated }`.
+- `DiffComparison::Commit`: a `DiffFileList` with `base` (first parent or
+  the empty tree) and `target` (the commit).
+
+## Reconciliation
+
+- `Reconciled::retries` counts attempts discarded because Git state moved.
+- `Reconciled::settled` is false when every attempt saw movement; such a
+  result is never published.
+- `SyncDiagnostics` adds `reconcile_retries` and `reconciles_withheld`.

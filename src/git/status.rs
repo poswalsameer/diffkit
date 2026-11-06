@@ -9,7 +9,8 @@ use super::{
     commands,
     errors::{GitError, Result},
     models::{
-        Change, ConflictKind, FileKind, FileStatus, RepositoryStatus, Similarity, SubmoduleState,
+        Change, ConflictKind, ConflictStage, ConflictStages, FileKind, FileStatus, ObjectId,
+        RepositoryStatus, Similarity, SubmoduleState,
     },
 };
 use std::path::Path;
@@ -180,6 +181,7 @@ fn ordinary(rest: &[u8]) -> Result<FileStatus> {
         similarity: None,
         file_kind: file_kind(&modes),
         submodule: submodule(f[1], CTX)?,
+        stages: None,
     })
 }
 
@@ -209,6 +211,7 @@ fn rename_or_copy(rest: &[u8], original: &[u8]) -> Result<FileStatus> {
         similarity: Some(Similarity(score)),
         file_kind: file_kind(&modes),
         submodule: submodule(f[1], CTX)?,
+        stages: None,
     })
 }
 
@@ -225,6 +228,17 @@ fn unmerged(rest: &[u8]) -> Result<FileStatus> {
         mode(f[4], CTX)?,
         mode(f[5], CTX)?,
     ];
+    // A stage that does not exist has mode 000000 and the zero object ID.
+    let stage = |m: u32, h: &[u8]| -> Result<Option<ConflictStage>> {
+        let oid = ObjectId::parse(h)
+            .ok_or_else(|| GitError::malformed(CTX, format!("object id {}", show(h))))?;
+        Ok((m != 0 && !oid.is_zero()).then_some(ConflictStage { mode: m, oid }))
+    };
+    let stages = ConflictStages {
+        base: stage(modes[0], f[6])?,
+        ours: stage(modes[1], f[7])?,
+        theirs: stage(modes[2], f[8])?,
+    };
     Ok(FileStatus {
         path: commands::path_from_git(f[9])?,
         original_path: None,
@@ -235,6 +249,7 @@ fn unmerged(rest: &[u8]) -> Result<FileStatus> {
         similarity: None,
         file_kind: file_kind(&modes),
         submodule: submodule(f[1], CTX)?,
+        stages: Some(stages),
     })
 }
 
@@ -249,6 +264,7 @@ fn untracked(rest: &[u8]) -> Result<FileStatus> {
         similarity: None,
         file_kind: None,
         submodule: None,
+        stages: None,
     })
 }
 
@@ -344,6 +360,36 @@ mod tests {
         assert_eq!(f.path, PathBuf::from("c d"));
         assert_eq!(&f.xy, b"AU");
         assert!(f.is_conflicted() && !f.is_staged() && !f.is_unstaged());
+        let stages = f.stages.as_ref().unwrap();
+        assert_eq!(
+            (
+                stages.base.is_some(),
+                stages.ours.is_some(),
+                stages.theirs.is_some()
+            ),
+            (false, true, false),
+            "only our stage exists for AU"
+        );
+        assert_eq!(stages.kind(), f.conflict);
+    }
+
+    #[test]
+    fn unmerged_record_keeps_every_stage() {
+        const A: &str = "1111111111111111111111111111111111111111";
+        const B: &str = "2222222222222222222222222222222222222222";
+        const C: &str = "3333333333333333333333333333333333333333";
+        let f = one(&format!(
+            "u UU N... 100644 100755 120000 100644 {A} {B} {C} f\0"
+        ));
+        let s = f.stages.unwrap();
+        assert_eq!(s.base.as_ref().unwrap().oid.as_str(), A);
+        assert_eq!(s.ours.as_ref().unwrap().mode, 0o100755);
+        assert_eq!(s.theirs.as_ref().unwrap().kind(), Some(FileKind::Symlink));
+        assert!(
+            parse(format!("u UU N... 100644 100644 100644 100644 {A} zz {C} f\0").as_bytes())
+                .is_err(),
+            "a malformed stage object id is an error, not a missing stage"
+        );
     }
 
     #[test]

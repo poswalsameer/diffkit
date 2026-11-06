@@ -6,8 +6,9 @@
 //! the way Git quotes paths; the snapshot itself keeps the raw path.
 
 use diffkit::git::models::{
-    BranchInfo, Change, CommitTrackingInfo, FileStatus, HeadState, RepositoryKind,
-    RepositorySnapshot, RepositoryStatus, TrackingRelation, TrackingUnavailable, UpstreamInfo,
+    BranchInfo, Change, CommitTrackingInfo, ConflictStage, FileStatus, HeadState, Operation,
+    RepositoryKind, RepositorySnapshot, RepositoryStatus, TrackingRelation, TrackingUnavailable,
+    UpstreamInfo,
 };
 use std::fmt::Write;
 
@@ -18,6 +19,7 @@ pub fn render(s: &RepositorySnapshot) -> String {
     let _ = writeln!(out, "{RULE}\nDIFFKIT - REPOSITORY INSPECTOR\n{RULE}");
     repository(&mut out, s);
     branch(&mut out, &s.branch);
+    operations(&mut out, &s.operations);
     upstream(&mut out, s);
     working_tree(&mut out, &s.status);
     files(&mut out, &s.status);
@@ -91,6 +93,16 @@ fn branch(out: &mut String, b: &BranchInfo) {
     };
     field(out, "HEAD", &[&head]);
     field(out, "Branch state", &[&state]);
+}
+
+fn operations(out: &mut String, ops: &[Operation]) {
+    let lines: Vec<String> = if ops.is_empty() {
+        vec!["None".into()]
+    } else {
+        ops.iter().map(Operation::description).collect()
+    };
+    let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
+    field(out, "Operation in progress", &lines);
 }
 
 fn upstream(out: &mut String, s: &RepositorySnapshot) {
@@ -263,6 +275,34 @@ fn files(out: &mut String, s: &RepositoryStatus) {
             let _ = writeln!(out, "  {}  {}  ({})", xy(f), entry_path(f), describe(f));
         }
     }
+    conflict_stages(out, s);
+}
+
+/// The index stages of each conflicted path, abbreviated to 12 digits.
+fn conflict_stages(out: &mut String, s: &RepositoryStatus) {
+    let mut entries = s
+        .files
+        .iter()
+        .filter_map(|f| Some((f, f.stages.as_ref()?)))
+        .peekable();
+    if entries.peek().is_none() {
+        return;
+    }
+    let _ = writeln!(out, "\nCONFLICT STAGES (index stages Git recorded)");
+    for (f, st) in entries {
+        let stage = |s: &Option<ConflictStage>| {
+            s.as_ref()
+                .map_or("(none)".to_string(), |s| s.oid.as_str()[..12].to_string())
+        };
+        let _ = writeln!(
+            out,
+            "  {}  base {}  ours {}  theirs {}",
+            display_path(&f.path),
+            stage(&st.base),
+            stage(&st.ours),
+            stage(&st.theirs)
+        );
+    }
 }
 
 fn side_note(f: &FileStatus, change: Change, verb: &str) -> String {
@@ -356,6 +396,7 @@ mod tests {
             similarity: None,
             file_kind: Some(FileKind::Regular),
             submodule: None,
+            stages: None,
         }
     }
 
@@ -383,6 +424,7 @@ mod tests {
             upstream,
             commit_tracking: t,
             status,
+            operations: Vec::new(),
         }
     }
 
@@ -438,5 +480,38 @@ mod tests {
             out.contains("State:\n  Clean: no staged, unstaged, untracked, or conflicted files\n")
         );
         assert!(out.contains("FILES\n\n  (none)\n"));
+        assert!(out.contains("Operation in progress:\n  None\n"));
+    }
+
+    #[test]
+    fn operations_and_conflict_stages_are_reported() {
+        let mut c = file("f", b"AA", Change::Unmerged, Change::Unmerged);
+        c.conflict = ConflictKind::from_xy(*b"AA");
+        let stage = ConflictStage {
+            mode: 0o100644,
+            oid: ObjectId::parse(&[b'c'; 40]).unwrap(),
+        };
+        c.stages = Some(ConflictStages {
+            base: None,
+            ours: Some(stage.clone()),
+            theirs: Some(stage),
+        });
+        let mut snap = snapshot(
+            RepositoryStatus {
+                files: vec![c],
+                ignored: vec![],
+            },
+            UpstreamInfo::NotConfigured,
+            CommitTrackingInfo::Unavailable(TrackingUnavailable::NoUpstream),
+        );
+        snap.operations = vec![Operation::Merge, Operation::Bisect { start: None }];
+        let out = render(&snap);
+        assert!(out.contains(
+            "Operation in progress:\n  A merge is in progress (MERGE_HEAD exists).\n  A bisect is in progress.\n"
+        ));
+        assert!(out.contains("  AA  f  (both added)\n"));
+        assert!(out.contains(
+            "\nCONFLICT STAGES (index stages Git recorded)\n  f  base (none)  ours cccccccccccc  theirs cccccccccccc\n"
+        ));
     }
 }

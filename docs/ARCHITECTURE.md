@@ -7,12 +7,13 @@ the binary owns argument handling and presentation.
 ```text
 src/
   main.rs            entry point: passes argv to app::cli and exits with its code
-  lib.rs             exposes `git`, `diff`, `display`, and `tui`
+  lib.rs             exposes `git`, `diff`, `display`, `sync`, and `tui`
   display.rs         safe display text: path quoting, content sanitizing, truncation
   app/
     cli.rs           argument parsing, dispatch, stdout/stderr, exit codes
     report.rs        formats a RepositorySnapshot as the text report
     diff_stats.rs    `diffkit diff-stats [--load]` diagnostic (Phase 2)
+    show.rs          `diffkit show <COMMIT>` (Phase 5)
   git/
     commands.rs      the only place a process is started
     errors.rs        GitError and Result
@@ -22,6 +23,8 @@ src/
     branches.rs      branch, HEAD, and upstream resolution
     commits.rs       ahead/behind tracking
     snapshot.rs      assembles one RepositorySnapshot
+    state.rs         operations in progress, from Git's state files (Phase 5)
+    history.rs       recent commits, commit metadata, revision resolution (Phase 5)
   diff/              Phase 2 diff engine
     engine.rs        DiffEngine: discover / load_file_diff / load_all, staleness checks
     commands.rs      argument arrays for diff-index, diff-files, ls-files, cat-file
@@ -33,6 +36,8 @@ src/
     untracked.rs     safe discovery and reading of untracked files
     models.rs        diff data model
     errors.rs        DiffError
+  sync/              Phase 4 synchronization: watcher, classifier, debounce,
+                     reconcile, scheduler (worker thread), diff cache
   tui/               Phase 3 terminal interface (Ratatui + Crossterm)
     app.rs           App state and updates; the only TUI code that calls the engines
     actions.rs       Action enum
@@ -147,3 +152,50 @@ The interface lives in the library (`src/tui/`), so integration tests drive
 binary only routes arguments. `display_path` moved from the binary's
 `report.rs` to `src/display.rs` so the report and the interface share it;
 `report.rs` re-exports it.
+
+## Phase 4: synchronization
+
+```text
+                    ┌──────────── diffkit-sync worker thread ────────────┐
+notify callback ──▶ │ bounded queue → classify → debounce → reconcile    │──┐
+ (try_send)         │                         (Git: snapshot + lists)    │  │ SyncEvent
+                    └────────────────────────────────────────────────────┘  │
+diffkit-input thread ── terminal events ──────────────────────────────────▶ main loop channel (bounded)
+                                                                            │
+main thread: App::apply_sync → App::apply_reconciled (one-step swap) → load_pending → draw
+```
+
+- `sync` depends on `git` and `diff`, never on `tui`. `tui` consumes
+  `sync`.
+- Manual refresh (`r`) sends a request to the same worker. Without a
+  worker (tests), it calls the same `reconcile` and `apply_reconciled`
+  functions inline.
+- `App::open` builds its first state with `reconcile`, and the worker
+  starts from that state (`App::reconciled`).
+- The diff cache moved from a 16-entry queue in `tui::app` to
+  `sync::cache::DiffCache`, which is byte-budgeted and revalidated against
+  Git's metadata after each reconciliation.
+
+## Phase 5: advanced states, history, release
+
+- `git::state` adds `RepositorySnapshot::operations` (merge, rebase, am,
+  cherry-pick, revert, bisect) from the per-worktree Git directory. No Git
+  process is involved.
+- `git::status` keeps the conflict stages that porcelain v2 `u` records
+  already contain (`FileStatus::stages`). `DiffEngine` attaches them, with
+  the working-tree presence, to `DiffContent::Unmerged(ConflictInfo)`.
+- `git::history` lists commits (`git log`) and resolves revisions
+  (`rev-parse --verify --end-of-options`).
+  `DiffEngine::discover_commit` lists a commit's files with
+  `diff-tree -r <parent> <commit>` as `DiffComparison::Commit`. Loading,
+  parsing, alignment, and display use the existing Phase 2 and 3 code,
+  unchanged.
+- `tui::App` gains `HistoryState` and `CommitView`. The history screen has
+  its own selection, scroll, and 16 MiB diff cache. The working-tree
+  state, cache, and synchronization are left untouched underneath.
+  Rendering selects the history list or commit views in `ui::render`, and
+  the diff panel draws whichever diff is on screen (`App::active_file`).
+- `sync::reconcile` wraps each reconciliation in a `StateMarker` check and
+  retries; unsettled results are withheld by the scheduler.
+- `tui::terminal` routes SIGTERM, SIGHUP, and SIGINT to the event loop
+  (Unix, `signal-hook`), so they take the normal restore path.

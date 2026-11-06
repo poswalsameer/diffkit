@@ -426,3 +426,84 @@ pub fn lines_of(buf: &Buffer) -> Vec<String> {
 pub fn screen_text(app: &App) -> String {
     screen(app).join("\n")
 }
+
+// ------------------------------------------------------------ read-only proof
+
+/// One entry of a [`fingerprint`]: path, content (a symlink's target for
+/// symlinks), and modification time.
+pub type Print = (PathBuf, Vec<u8>, Option<std::time::SystemTime>);
+
+/// Every file and symlink under `dir`, including `.git` (index, refs,
+/// HEAD, objects, state files): content and modification time. Symlinks
+/// are recorded, never followed. Two equal fingerprints mean nothing in
+/// the repository or its working tree was written.
+pub fn fingerprint(dir: &Path) -> Vec<Print> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d).unwrap() {
+            let p = e.unwrap().path();
+            let m = std::fs::symlink_metadata(&p).unwrap();
+            if m.file_type().is_symlink() {
+                let target = std::fs::read_link(&p).unwrap();
+                out.push((p, target.to_string_lossy().into_owned().into_bytes(), None));
+            } else if m.is_dir() {
+                out.push((p.clone(), Vec::new(), None));
+                stack.push(p);
+            } else {
+                let content = std::fs::read(&p).unwrap_or_default();
+                out.push((p, content, m.modified().ok()));
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Asserts that `f` leaves `dir` byte-for-byte unchanged.
+pub fn assert_read_only<T>(dir: &Path, f: impl FnOnce() -> T) -> T {
+    let before = fingerprint(dir);
+    let result = f();
+    let after = fingerprint(dir);
+    if before != after {
+        let changed: Vec<_> = after
+            .iter()
+            .filter(|a| !before.contains(a))
+            .chain(before.iter().filter(|b| !after.contains(b)))
+            .map(|(p, _, _)| p.display().to_string())
+            .collect();
+        panic!("inspection wrote to the repository: {changed:#?}");
+    }
+    result
+}
+
+impl Repo {
+    /// Creates a symlink at `rel` pointing to `target` (Unix only).
+    #[cfg(unix)]
+    pub fn symlink(&self, target: &str, rel: &str) {
+        let p = self.path.join(rel);
+        if let Some(dir) = p.parent() {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let _ = std::fs::remove_file(&p);
+        std::os::unix::fs::symlink(target, p).unwrap();
+    }
+
+    pub fn write_bytes(&self, rel: impl AsRef<Path>, bytes: &[u8]) {
+        let p = self.path.join(rel);
+        if let Some(dir) = p.parent() {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        std::fs::write(p, bytes).unwrap();
+    }
+
+    /// `git merge <branch>`, which must stop with conflicts.
+    pub fn failing_merge(&self, branch: &str) {
+        let out = self.git_output(&["merge", "--no-edit", branch]);
+        assert!(
+            !out.status.success(),
+            "expected a conflict merging {branch}: {}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+    }
+}

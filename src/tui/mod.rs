@@ -17,4 +17,4 @@ pub mod ui;
 
 pub use actions::Action;
 pub use app::App;
-pub use terminal::{run, TuiError};
+pub use terminal::{run, RunOptions, TuiError};

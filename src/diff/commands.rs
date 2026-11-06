@@ -2,7 +2,8 @@
 //! goes through [`crate::git::commands`], the only place processes start.
 //!
 //! The plumbing commands are used: `git diff-index --cached <base>` (staged),
-//! `git diff-files` (unstaged), and `git diff-index <base>` (combined).
+//! `git diff-files` (unstaged), `git diff-index <base>` (combined), and
+//! `git diff-tree -r <parent> <commit>` (commit inspection).
 //! Porcelain `git diff` refreshes and rewrites `.git/index` after a
 //! working-tree comparison even with `GIT_OPTIONAL_LOCKS=0`; the plumbing
 //! commands never write. They do list files whose stat data changed but whose
@@ -48,34 +49,47 @@ fn command(comparison: DiffComparison) -> Vec<OsString> {
         DiffComparison::Staged => vec!["diff-index".into(), "--cached".into()],
         DiffComparison::Unstaged | DiffComparison::Untracked => vec!["diff-files".into()],
         DiffComparison::Combined => vec!["diff-index".into()],
+        DiffComparison::Commit => vec!["diff-tree".into(), "-r".into()],
     };
     args.extend(COMMON.iter().map(OsString::from));
     args
 }
 
-/// `diff-index` takes the base tree-ish after its options.
-fn base_arg(comparison: DiffComparison, base: &ObjectId, args: &mut Vec<OsString>) {
-    if matches!(
-        comparison,
-        DiffComparison::Staged | DiffComparison::Combined
-    ) {
-        args.push(base.as_str().into());
+/// The trees compared. `diff-index` takes the base tree-ish after its
+/// options; `diff-tree` takes the base and then the target commit.
+#[derive(Debug, Clone, Copy)]
+pub struct Range<'a> {
+    pub base: &'a ObjectId,
+    /// The commit inspected ([`DiffComparison::Commit`] only).
+    pub target: Option<&'a ObjectId>,
+}
+
+fn range_args(comparison: DiffComparison, range: Range, args: &mut Vec<OsString>) {
+    match comparison {
+        DiffComparison::Staged | DiffComparison::Combined => args.push(range.base.as_str().into()),
+        DiffComparison::Commit => {
+            args.push(range.base.as_str().into());
+            if let Some(t) = range.target {
+                args.push(t.as_str().into());
+            }
+        }
+        DiffComparison::Unstaged | DiffComparison::Untracked => {}
     }
 }
 
 /// Metadata for every changed file: one `--raw` record (modes, object IDs,
 /// status, paths) and one `--numstat` record (line counts or binary) each.
-pub fn discovery(comparison: DiffComparison, base: &ObjectId) -> Vec<OsString> {
+pub fn discovery(comparison: DiffComparison, range: Range) -> Vec<OsString> {
     let mut args = command(comparison);
     args.extend(["--raw", "--numstat", "-z", "--no-abbrev"].map(OsString::from));
-    base_arg(comparison, base, &mut args);
+    range_args(comparison, range, &mut args);
     args
 }
 
 /// Unified patch for the given paths (all changed paths if empty).
 pub fn patch(
     comparison: DiffComparison,
-    base: &ObjectId,
+    range: Range,
     context: u32,
     paths: &[&Path],
 ) -> Vec<OsString> {
@@ -91,7 +105,7 @@ pub fn patch(
         .map(OsString::from),
     );
     args.push(format!("-U{context}").into());
-    base_arg(comparison, base, &mut args);
+    range_args(comparison, range, &mut args);
     args.push("--".into());
     args.extend(paths.iter().map(|p| p.as_os_str().to_owned()));
     args
@@ -112,11 +126,16 @@ mod tests {
         ObjectId::parse(&[b'a'; 40]).unwrap()
     }
 
+    fn head(base: &ObjectId) -> Range<'_> {
+        Range { base, target: None }
+    }
+
     #[test]
     fn comparisons_select_distinct_sides() {
-        let staged = discovery(DiffComparison::Staged, &oid());
-        let unstaged = discovery(DiffComparison::Unstaged, &oid());
-        let combined = discovery(DiffComparison::Combined, &oid());
+        let o = oid();
+        let staged = discovery(DiffComparison::Staged, head(&o));
+        let unstaged = discovery(DiffComparison::Unstaged, head(&o));
+        let combined = discovery(DiffComparison::Combined, head(&o));
         let base = OsString::from("a".repeat(40));
         assert_eq!(staged[..2], ["diff-index", "--cached"].map(OsString::from));
         assert_eq!(staged.last().unwrap(), &base);
@@ -129,9 +148,10 @@ mod tests {
 
     #[test]
     fn patch_paths_follow_double_dash() {
+        let o = oid();
         let a = patch(
             DiffComparison::Unstaged,
-            &oid(),
+            head(&o),
             5,
             &[Path::new("-weird name"), Path::new(":(glob)*")],
         );
@@ -149,5 +169,27 @@ mod tests {
         ] {
             assert!(a.contains(&OsString::from(opt)), "{opt}");
         }
+    }
+
+    #[test]
+    fn commit_inspection_compares_parent_and_commit_trees() {
+        let (p, c) = (oid(), ObjectId::parse(&[b'b'; 40]).unwrap());
+        let range = Range {
+            base: &p,
+            target: Some(&c),
+        };
+        let d = discovery(DiffComparison::Commit, range);
+        assert_eq!(d[..2], ["diff-tree", "-r"].map(OsString::from));
+        assert_eq!(
+            d[d.len() - 2..],
+            [
+                OsString::from("a".repeat(40)),
+                OsString::from("b".repeat(40))
+            ]
+        );
+        let pt = patch(DiffComparison::Commit, range, 3, &[Path::new("f")]);
+        let dd = pt.iter().position(|x| x == "--").unwrap();
+        assert_eq!(pt[dd - 1], OsString::from("b".repeat(40)));
+        assert!(pt.contains(&OsString::from("--no-textconv")));
     }
 }
