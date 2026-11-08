@@ -32,20 +32,26 @@ use super::{
 use crate::git::{
     self,
     commands::{path_bytes, LimitedOutput},
-    models::{ConflictKind, ConflictStages, ObjectFormat, ObjectId, RepositorySnapshot},
+    models::{
+        ConflictKind, ConflictStages, ObjectFormat, ObjectId, RepositorySnapshot, RepositoryStatus,
+    },
     snapshot,
 };
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     path::{Path, PathBuf},
 };
+
+/// Most path bytes [`DiffEngine::discover_reported`] passes on one command
+/// line; above it the whole tree is compared. Far below the smallest
+/// platform limit (32,767 UTF-16 units for a Windows command line).
+pub const MAX_PATHSPEC_BYTES: usize = 16 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct DiffEngine {
     root: PathBuf,
     head: Option<ObjectId>,
     object_format: ObjectFormat,
-    conflicted: HashSet<PathBuf>,
     /// Kind and index stages of each conflicted path, from the snapshot.
     conflicts: HashMap<PathBuf, (Option<ConflictKind>, Option<ConflictStages>)>,
     options: DiffOptions,
@@ -55,20 +61,13 @@ pub struct DiffEngine {
 type PathKey = (Option<Vec<u8>>, Option<Vec<u8>>);
 
 impl DiffEngine {
-    /// Builds an engine from an existing Phase 1 snapshot. HEAD and the set
-    /// of conflicted paths are taken from it; no Git command runs.
+    /// Builds an engine from an existing Phase 1 snapshot. HEAD and the
+    /// conflicted paths are taken from it; no Git command runs.
     pub fn from_snapshot(s: &RepositorySnapshot, options: DiffOptions) -> Self {
         Self {
             root: s.repository.root.clone(),
             head: s.branch.head_commit.clone(),
             object_format: s.repository.object_format,
-            conflicted: s
-                .status
-                .files
-                .iter()
-                .filter(|f| f.is_conflicted())
-                .map(|f| f.path.clone())
-                .collect(),
             conflicts: s
                 .status
                 .files
@@ -110,37 +109,113 @@ impl DiffEngine {
     /// [`DiffComparison::Commit`] needs a commit; use
     /// [`DiffEngine::discover_commit`].
     pub fn discover(&self, comparison: DiffComparison) -> Result<DiffFileList> {
-        let (base, files, stat_only_entries) = match comparison {
-            DiffComparison::Untracked => (None, untracked::discover(&self.root)?, 0),
-            DiffComparison::Commit => {
-                return Err(DiffError::parse(
-                    0,
-                    "commit inspection needs a commit (use discover_commit)",
-                ))
+        match comparison {
+            DiffComparison::Untracked => Ok(DiffFileList {
+                comparison,
+                base: None,
+                target: None,
+                files: untracked::discover(&self.root)?,
+                stat_only_entries: 0,
+            }),
+            DiffComparison::Commit => Err(DiffError::parse(
+                0,
+                "commit inspection needs a commit (use discover_commit)",
+            )),
+            _ => self.discover_tracked(comparison, None),
+        }
+    }
+
+    /// Like [`DiffEngine::discover`], but asks Git only about the paths that
+    /// `status` (taken just before, from the same repository) reports:
+    ///
+    /// - tracked comparisons compare only the tracked paths status lists
+    ///   (both sides of a rename or copy), and run no Git command when
+    ///   there are none. Every comparison gets all of them, not just those
+    ///   status files under that side: the plumbing commands can classify a
+    ///   path differently (an intent-to-add file is a working-tree change
+    ///   for status but an addition for `diff-index --cached`);
+    /// - the untracked list is status's `?` records, without another walk.
+    ///
+    /// The whole-tree commands also re-examine every file whose stat data
+    /// changed but whose content did not (Diffkit never refreshes the
+    /// index), so each would repeat the content checks status just made.
+    /// Above [`MAX_PATHSPEC_BYTES`] of paths, the whole tree is compared, to
+    /// stay within command-line limits. Files whose stat data alone changed
+    /// are not listed either way; [`DiffFileList::stat_only_entries`] only
+    /// counts the ones a whole-tree comparison examined.
+    pub fn discover_reported(
+        &self,
+        comparison: DiffComparison,
+        status: &RepositoryStatus,
+    ) -> Result<DiffFileList> {
+        use DiffComparison::*;
+        match comparison {
+            Commit => self.discover(comparison),
+            Untracked => Ok(DiffFileList {
+                comparison,
+                base: None,
+                target: None,
+                files: untracked::from_git_paths(
+                    &self.root,
+                    status
+                        .files
+                        .iter()
+                        .filter(|f| f.is_untracked())
+                        .map(|f| path_bytes(&f.path)),
+                )?,
+                stat_only_entries: 0,
+            }),
+            Staged | Unstaged | Combined => {
+                let mut paths: Vec<&Path> = Vec::new();
+                for f in status.files.iter().filter(|f| !f.is_untracked()) {
+                    paths.push(&f.path);
+                    paths.extend(f.original_path.as_deref());
+                }
+                let size: usize = paths.iter().map(|p| p.as_os_str().len() + 1).sum();
+                if size > MAX_PATHSPEC_BYTES {
+                    self.discover_tracked(comparison, None)
+                } else {
+                    self.discover_tracked(comparison, Some(&paths))
+                }
             }
-            _ => {
-                let base = self.base();
-                let range = commands::Range {
-                    base: &base,
-                    target: None,
-                };
-                let out = git::commands::run(&self.root, &commands::discovery(comparison, range))?;
-                let found = discovery::parse_raw_numstat(&out)?;
-                let files =
-                    discovery::build_files(found.pairs, comparison, &self.root, &self.conflicted)?;
-                (
-                    (comparison != DiffComparison::Unstaged).then_some(base),
-                    files,
-                    found.stat_only,
-                )
-            }
+        }
+    }
+
+    /// Staged, unstaged, or combined discovery: of the whole tree, or of
+    /// `paths` only (none: an empty list, without running Git).
+    fn discover_tracked(
+        &self,
+        comparison: DiffComparison,
+        paths: Option<&[&Path]>,
+    ) -> Result<DiffFileList> {
+        let base = self.base();
+        let range = commands::Range {
+            base: &base,
+            target: None,
         };
+        let found = match paths {
+            Some([]) => discovery::Discovered {
+                pairs: Vec::new(),
+                stat_only: 0,
+            },
+            Some(paths) => discovery::parse_raw_numstat(&git::commands::run(
+                &self.root,
+                &commands::discovery_of(comparison, range, paths),
+            )?)?,
+            None => discovery::parse_raw_numstat(&git::commands::run(
+                &self.root,
+                &commands::discovery(comparison, range),
+            )?)?,
+        };
+        let files = discovery::build_files(found.pairs, comparison, &self.root, |p| {
+            self.conflicts.contains_key(p)
+        })?;
         Ok(DiffFileList {
             comparison,
-            base,
+            base: (comparison != DiffComparison::Unstaged).then_some(base),
             target: None,
             files,
-            stat_only_entries,
+            stat_only_entries: found.stat_only,
         })
     }
 
@@ -162,12 +237,8 @@ impl DiffEngine {
         let args = commands::discovery(DiffComparison::Commit, range);
         let out = git::commands::run(&self.root, &args)?;
         let found = discovery::parse_raw_numstat(&out)?;
-        let files = discovery::build_files(
-            found.pairs,
-            DiffComparison::Commit,
-            &self.root,
-            &HashSet::new(),
-        )?;
+        let files =
+            discovery::build_files(found.pairs, DiffComparison::Commit, &self.root, |_| false)?;
         Ok(DiffFileList {
             comparison: DiffComparison::Commit,
             base: Some(base),
@@ -239,20 +310,36 @@ impl DiffEngine {
     /// `git diff`; if its output exceeds `max_total_patch_bytes`, files are
     /// loaded one by one instead (each bounded by `max_file_patch_bytes`).
     pub fn load_all(&self, list: &DiffFileList) -> Result<DiffCollection> {
-        let one_by_one = |unexpected_paths| DiffCollection {
+        let mut files = Vec::with_capacity(list.len());
+        let unexpected_paths = self.load_each(list, |id, result| {
+            files.push(LoadedFile { id, result });
+        })?;
+        Ok(DiffCollection {
             comparison: list.comparison,
-            files: list
-                .files
-                .iter()
-                .map(|f| LoadedFile {
-                    id: f.id,
-                    result: self.load_file_diff(list, f.id),
-                })
-                .collect(),
+            files,
             unexpected_paths,
+        })
+    }
+
+    /// Like [`DiffEngine::load_all`], but hands each file's result to
+    /// `each` as soon as it is built, exactly once per file and in list
+    /// order, instead of keeping them all. The patch text of a file is freed
+    /// once its result is built, so a caller that summarizes and drops each
+    /// result holds at most the patch and one built file at a time. Returns
+    /// the paths Git reported that discovery did not see.
+    pub fn load_each(
+        &self,
+        list: &DiffFileList,
+        mut each: impl FnMut(FileId, Result<FileDiff>),
+    ) -> Result<Vec<PathBuf>> {
+        let one_by_one = |each: &mut dyn FnMut(FileId, Result<FileDiff>)| {
+            for f in &list.files {
+                each(f.id, self.load_file_diff(list, f.id));
+            }
+            Ok(Vec::new())
         };
         if list.comparison == DiffComparison::Untracked || list.is_empty() {
-            return Ok(one_by_one(Vec::new()));
+            return one_by_one(&mut each);
         }
         let (base, target) = Self::range_of(list, &self.base());
         let range = commands::Range {
@@ -267,28 +354,23 @@ impl DiffEngine {
         )? {
             LimitedOutput::Complete(out) if out.status.success() => out,
             LimitedOutput::Complete(out) => return Err(git::commands::failure(&args, &out).into()),
-            LimitedOutput::Exceeded { .. } => return Ok(one_by_one(Vec::new())),
+            LimitedOutput::Exceeded { .. } => return one_by_one(&mut each),
         };
-        let mut sections: Vec<Option<FilePatch>> = parser::parse_patch(&out.stdout)?
-            .into_iter()
-            .map(Some)
-            .collect();
-        let mut by_key: HashMap<PathKey, Vec<usize>> = HashMap::new();
+        let parsed = parser::parse_patch(&out.stdout)?;
+        drop(out);
+        let mut sections: Vec<Option<FilePatch>> = parsed.into_iter().map(Some).collect();
+        let mut by_key: HashMap<PathKey, std::collections::VecDeque<usize>> = HashMap::new();
         for (i, s) in sections.iter().enumerate() {
             by_key
                 .entry(key_of(s.as_ref().expect("fresh")))
                 .or_default()
-                .push(i);
+                .push_back(i);
         }
-        let mut files = Vec::with_capacity(list.len());
         for file in &list.files {
             let mut matched = Vec::new();
             let mut missing = false;
             for key in section_keys(file) {
-                match by_key
-                    .get_mut(&key)
-                    .and_then(|v| (!v.is_empty()).then(|| v.remove(0)))
-                {
+                match by_key.get_mut(&key).and_then(|v| v.pop_front()) {
                     Some(i) => matched.push(sections[i].take().expect("each section used once")),
                     None => missing = true,
                 }
@@ -301,10 +383,7 @@ impl DiffEngine {
                 self.check_worktree(file)
                     .and_then(|()| self.build(file, matched))
             };
-            files.push(LoadedFile {
-                id: file.id,
-                result,
-            });
+            each(file.id, result);
         }
         let mut unexpected_paths = Vec::new();
         for s in sections.into_iter().flatten() {
@@ -312,11 +391,7 @@ impl DiffEngine {
                 unexpected_paths.push(git::commands::path_from_git(&p)?);
             }
         }
-        Ok(DiffCollection {
-            comparison: list.comparison,
-            files,
-            unexpected_paths,
-        })
+        Ok(unexpected_paths)
     }
 
     /// The working-tree side must still match the metadata seen at discovery.
@@ -388,13 +463,14 @@ impl DiffEngine {
                 file.new_oid.as_ref().or(new_oid.as_ref()),
             )?)
         } else if sections.len() == 1 {
-            let hunks = hunk::build_hunks(&first.hunks, &self.options.alignment)?;
+            let only = sections.into_iter().next().expect("one section");
+            let hunks = hunk::build_hunks(only.hunks, &self.options.alignment)?;
             DiffContent::Text { hunks }
         } else {
             // A type change is printed as a deletion and an addition; present
             // it as one hunk from the old content to the new content.
             DiffContent::Text {
-                hunks: type_change_hunk(&sections, &self.options.alignment)?
+                hunks: type_change_hunk(sections, &self.options.alignment)?
                     .into_iter()
                     .collect(),
             }
@@ -501,13 +577,13 @@ fn submodule_change(file: &DiffFile, sections: &[FilePatch]) -> SubmoduleChange 
 }
 
 fn type_change_hunk(
-    sections: &[FilePatch],
+    sections: Vec<FilePatch>,
     opts: &super::models::AlignmentOptions,
 ) -> Result<Option<super::models::DiffHunk>> {
     let mut old_lines = Vec::new();
     let mut new_lines = Vec::new();
     for s in sections {
-        for h in hunk::build_hunks(&s.hunks, opts)? {
+        for h in hunk::build_hunks(s.hunks, opts)? {
             for row in h.rows {
                 old_lines.extend(row.old_line);
                 new_lines.extend(row.new_line);

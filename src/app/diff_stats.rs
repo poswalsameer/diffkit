@@ -5,10 +5,34 @@
 
 use super::report::display_path;
 use diffkit::diff::{
-    DiffCollection, DiffComparison, DiffContent, DiffEngine, DiffFile, DiffFileList, DiffRowKind,
-    FileChangeKind, FileDiff,
+    DiffComparison, DiffContent, DiffEngine, DiffFile, DiffFileList, DiffRowKind, FileChangeKind,
+    FileDiff,
 };
-use std::fmt::Write;
+use std::{fmt::Write, path::PathBuf};
+
+/// The loaded results of one list, summarized as each file loads so the
+/// diffs themselves are never all held at once.
+pub struct Loaded {
+    /// One line per file, in list order.
+    details: Vec<String>,
+    unexpected_paths: Vec<PathBuf>,
+}
+
+impl Loaded {
+    fn load(engine: &DiffEngine, list: &DiffFileList) -> Result<Self, diffkit::diff::DiffError> {
+        let mut details = Vec::with_capacity(list.len());
+        let unexpected_paths = engine.load_each(list, |_, result| {
+            details.push(match result {
+                Ok(diff) => loaded_detail(&diff),
+                Err(e) => format!("error: {e}"),
+            })
+        })?;
+        Ok(Self {
+            details,
+            unexpected_paths,
+        })
+    }
+}
 
 pub fn render(engine: &DiffEngine, load: bool) -> Result<String, diffkit::diff::DiffError> {
     let mut out = String::from("DIFFKIT - DIFF SUMMARY\n");
@@ -22,12 +46,12 @@ pub fn render(engine: &DiffEngine, load: bool) -> Result<String, diffkit::diff::
     );
     for comparison in DiffComparison::ALL {
         let list = engine.discover(comparison)?;
-        let collection = if load {
-            Some(engine.load_all(&list)?)
+        let loaded = if load {
+            Some(Loaded::load(engine, &list)?)
         } else {
             None
         };
-        section(&mut out, &list, collection.as_ref());
+        section(&mut out, &list, loaded.as_ref());
     }
     Ok(out)
 }
@@ -44,7 +68,7 @@ fn title(c: DiffComparison) -> &'static str {
 
 /// One comparison's file list (and, when loaded, per-file results).
 /// Shared with `diffkit show`.
-pub fn section(out: &mut String, list: &DiffFileList, loaded: Option<&DiffCollection>) {
+pub fn section(out: &mut String, list: &DiffFileList, loaded: Option<&Loaded>) {
     let stats = list.line_stats();
     let _ = write!(
         out,
@@ -64,26 +88,13 @@ pub fn section(out: &mut String, list: &DiffFileList, loaded: Option<&DiffCollec
         );
     }
     out.push('\n');
-    for f in &list.files {
+    for (i, f) in list.files.iter().enumerate() {
         let _ = write!(out, "  {:<3} {}", code(f), paths(f));
         if let Some(d) = detail(f) {
             let _ = write!(out, "  {d}");
         }
         if let Some(c) = loaded {
-            let result = &c
-                .files
-                .iter()
-                .find(|l| l.id == f.id)
-                .expect("every file loaded")
-                .result;
-            let _ = write!(
-                out,
-                "  | {}",
-                match result {
-                    Ok(diff) => loaded_detail(diff),
-                    Err(e) => format!("error: {e}"),
-                }
-            );
+            let _ = write!(out, "  | {}", c.details[i]);
         }
         out.push('\n');
     }

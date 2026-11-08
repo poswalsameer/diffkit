@@ -251,7 +251,8 @@ Categories:
 ## Reconciled
 
 `Reconciled { snapshot, lists, trigger, duration, reused }`:
-- `snapshot`: a Phase 1 `RepositorySnapshot`.
+- `snapshot`: a Phase 1 `RepositorySnapshot`, behind an `Arc` so a result
+  can be kept as the next run's base without copying it.
 - `lists`: one `Result<Arc<DiffFileList>, String>` per comparison, in
   `Comparison::ALL` order. A failed list does not fail the others.
 - `trigger`: the `ChangeSet` that caused the run.

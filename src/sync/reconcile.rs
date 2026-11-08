@@ -21,12 +21,25 @@
 //! another. So that a result never mixes two repository states (a status
 //! from before `git add` with lists from after it), reconciliation records
 //! a [`StateMarker`] of the index, HEAD, the current branch's ref,
-//! `packed-refs`, and operation state before reading and compares it after.
-//! If anything moved, it starts over, up to [`MAX_ATTEMPTS`] times. If Git
-//! is still changing after that, the result is marked
+//! `packed-refs`, and operation state before reading, and compares it after
+//! the snapshot, after each list, and at the end. As soon as anything
+//! moved, the attempt stops (the rest would be discarded anyway) and, after
+//! a short pause that lets the Git command finish, starts over, up to
+//! [`MAX_ATTEMPTS`] times. The last attempt always reads everything. If Git
+//! is still changing then, the result is marked
 //! [`Reconciled::settled`]` == false`; the worker does not publish it and
 //! runs again once Git goes quiet. Working-tree files are not
 //! part of the marker; edits there are caught by the watcher.
+//!
+//! Git work per reconciliation is kept to what the trigger requires:
+//!
+//! - Repository discovery (`rev-parse`) is reused from the previous result
+//!   unless refs, config, or the repository's structure may have changed.
+//! - When only working-tree files, the index, or ignore rules changed,
+//!   status skips the ahead/behind walk and the upstream is reused
+//!   ([`snapshot::inspect_repository_since`]).
+//! - The tracked lists compare only the paths status reported, and the
+//!   untracked list comes from status ([`DiffEngine::discover_reported`]).
 
 use super::{classifier::WatchLayout, events::ChangeSet};
 use crate::{
@@ -47,6 +60,24 @@ use std::{
 
 /// Attempts per reconciliation when Git state keeps moving underneath it.
 pub const MAX_ATTEMPTS: usize = 3;
+
+/// Pause before attempt `n + 1` after attempt `n` saw Git state move.
+const RETRY_PAUSE: Duration = Duration::from_millis(10);
+
+/// Triggers that cannot move the repository's locations, shallowness, or
+/// object format, so repository discovery can be reused.
+const LOCAL_CHANGES: ChangeSet = ChangeSet::WORKTREE
+    .union(ChangeSet::IGNORE_RULES)
+    .union(ChangeSet::INDEX)
+    .union(ChangeSet::HEAD)
+    .union(ChangeSet::MERGE_STATE)
+    .union(ChangeSet::REBASE_STATE);
+
+/// Triggers that cannot change HEAD, refs, or the upstream, so the upstream
+/// and ahead/behind counts can be reused.
+const NO_REF_CHANGES: ChangeSet = ChangeSet::WORKTREE
+    .union(ChangeSet::IGNORE_RULES)
+    .union(ChangeSet::INDEX);
 
 /// Metadata of one file: absent, or (length, modification time, inode).
 type Stamp = Option<(u64, Option<SystemTime>, u64)>;
@@ -111,7 +142,8 @@ pub type ListResult = Result<Arc<DiffFileList>, String>;
 /// A complete, consistent result ready to be published.
 #[derive(Debug, Clone)]
 pub struct Reconciled {
-    pub snapshot: RepositorySnapshot,
+    /// Shared, so keeping a result as the base for the next one is cheap.
+    pub snapshot: Arc<RepositorySnapshot>,
     /// In [`DiffComparison::ALL`] order.
     pub lists: Vec<ListResult>,
     pub trigger: ChangeSet,
@@ -161,57 +193,101 @@ pub fn reconcile(
     previous: Option<&Reconciled>,
 ) -> Result<Reconciled, GitError> {
     let began = Instant::now();
+    let known = previous
+        .filter(|_| trigger.within(LOCAL_CHANGES))
+        .map(|p| p.snapshot.repository.clone());
+    let reusing = known.is_some();
+    let mut repo = match known {
+        Some(r) => r,
+        None => repository::discover_from(start)?,
+    };
+    let mut rediscovered = false;
     let mut retries = 0;
     loop {
-        let repo = repository::discover_from(start)?;
         let before = StateMarker::read(&repo);
-        let (snapshot, lists, reused) = read_state(repo, options, trigger, previous)?;
-        let moved = StateMarker::read(&snapshot.repository) != before;
-        if moved && retries + 1 < MAX_ATTEMPTS {
-            retries += 1;
-            continue;
+        let last = retries + 1 >= MAX_ATTEMPTS;
+        let attempt = match read_state(&repo, options, trigger, previous, &before, !last) {
+            // The reused locations may be out of date (a repository moved
+            // without a structural event): discover once more and retry.
+            Err(_) if reusing && !rediscovered => {
+                rediscovered = true;
+                repo = repository::discover_from(start)?;
+                continue;
+            }
+            other => other?,
+        };
+        // `None`: Git state moved partway and the attempt stopped early.
+        let moved = attempt.is_none() || StateMarker::read(&repo) != before;
+        match attempt {
+            Some((snapshot, lists, reused)) if !moved || last => {
+                return Ok(Reconciled {
+                    snapshot: Arc::new(snapshot),
+                    lists,
+                    trigger,
+                    duration: began.elapsed(),
+                    reused,
+                    retries,
+                    settled: !moved,
+                })
+            }
+            _ => {
+                retries += 1;
+                std::thread::sleep(RETRY_PAUSE * retries as u32);
+            }
         }
-        return Ok(Reconciled {
-            snapshot,
-            lists,
-            trigger,
-            duration: began.elapsed(),
-            reused,
-            retries,
-            settled: !moved,
-        });
     }
 }
 
-/// One attempt: the snapshot, then each list (reused when allowed).
+/// The snapshot, the lists in [`DiffComparison::ALL`] order, and how many
+/// lists were reused.
+type State = (RepositorySnapshot, Vec<ListResult>, usize);
+
+/// One attempt: the snapshot, then each list (reused when allowed). With
+/// `stop_early`, returns `None` as soon as the Git state differs from
+/// `before`, checked after the snapshot and after each list.
 fn read_state(
-    repo: RepositoryInfo,
+    repo: &RepositoryInfo,
     options: DiffOptions,
     trigger: ChangeSet,
     previous: Option<&Reconciled>,
-) -> Result<(RepositorySnapshot, Vec<ListResult>, usize), GitError> {
-    let snapshot = snapshot::inspect_repository(repo)?;
-    let engine = DiffEngine::from_snapshot(&snapshot, options);
+    before: &StateMarker,
+    stop_early: bool,
+) -> Result<Option<State>, GitError> {
+    let moved = || stop_early && StateMarker::read(repo) != *before;
     let comparable = previous.filter(|p| {
-        p.snapshot.branch.head_commit == snapshot.branch.head_commit
-            && p.snapshot.repository.root == snapshot.repository.root
-            && p.snapshot.repository.git_dir == snapshot.repository.git_dir
+        p.snapshot.repository.root == repo.root && p.snapshot.repository.git_dir == repo.git_dir
     });
+    let snapshot = match comparable.filter(|_| trigger.within(NO_REF_CHANGES)) {
+        Some(p) => snapshot::inspect_repository_since(repo.clone(), &p.snapshot)?,
+        None => snapshot::inspect_repository(repo.clone())?,
+    };
+    if moved() {
+        return Ok(None);
+    }
+    let engine = DiffEngine::from_snapshot(&snapshot, options);
+    let same_head =
+        comparable.filter(|p| p.snapshot.branch.head_commit == snapshot.branch.head_commit);
     let mut reused = 0;
-    let lists = DiffComparison::ALL
-        .iter()
-        .enumerate()
-        .map(|(i, &c)| {
-            if let Some(Ok(prev)) = comparable.and_then(|p| p.lists.get(i)) {
-                if reusable(c, trigger) {
-                    reused += 1;
-                    return Ok(Arc::clone(prev));
-                }
+    let mut lists = Vec::with_capacity(DiffComparison::ALL.len());
+    for (i, &c) in DiffComparison::ALL.iter().enumerate() {
+        if let Some(Ok(prev)) = same_head.and_then(|p| p.lists.get(i)) {
+            if reusable(c, trigger) {
+                reused += 1;
+                lists.push(Ok(Arc::clone(prev)));
+                continue;
             }
-            engine.discover(c).map(Arc::new).map_err(|e| e.to_string())
-        })
-        .collect();
-    Ok((snapshot, lists, reused))
+        }
+        lists.push(
+            engine
+                .discover_reported(c, &snapshot.status)
+                .map(Arc::new)
+                .map_err(|e| e.to_string()),
+        );
+        if moved() {
+            return Ok(None);
+        }
+    }
+    Ok(Some((snapshot, lists, reused)))
 }
 
 /// Untracked directories that are themselves ignored, as absolute paths.

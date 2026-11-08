@@ -407,3 +407,42 @@ Reading the comparison:
 
 Not measured: Linux, Windows, or macOS Intel; a real terminal emulator's
 output time; idle CPU; long interactive sessions.
+
+## Optimization pass — 2026-11-08
+
+Same-session comparison of the committed Phase 5 code (`f06eae4`, exported
+with `git archive`) and the optimized working tree. Both were built with
+the same release settings and a shared benchmark program, and run
+alternately against the same scratch repositories on this Mac (Apple
+Silicon, Git 2.54.0). Medians of 9 runs (5 for alignment) after 2
+warm-ups; two rounds gave the same numbers within 1 ms.
+
+Repository: 20,000 tracked files, 50 modified, 30 untracked. "Stat-dirty":
+additionally 11,000 files whose modification time changed but whose content
+did not, which Git re-checks on every read until the index is refreshed,
+which Diffkit never does.
+
+| Scenario | Before | After |
+|---|---:|---:|
+| Full refresh, refreshed index | 80.1 ms, 6 Git | 54.8 ms, 5 Git |
+| Worktree-triggered refresh, refreshed index | 75.9 ms, 5 Git | 44.3 ms, 3 Git |
+| Full refresh, stat-dirty | 691.8 ms, 6 Git | 164.1 ms, 5 Git |
+| Worktree-triggered refresh, stat-dirty | 690.4 ms, 5 Git | 154.0 ms, 3 Git |
+| Align 20,000 replaced short lines | 48.5 ms | 10.6 ms |
+| Align 20,000 replaced 300-byte lines | 1,157.0 ms | 552.6 ms |
+| `diff-stats --load`, 1,000 files × 400 changed lines: wall | 2.98 s | 1.11 s |
+| same: peak footprint / max RSS | 157.9 / 199.9 MiB | 111.0 / 116.0 MiB |
+
+`diff-stats --load` printed byte-identical output before and after. Where
+the time went before, per command on the same repository: `status` 25 ms
+(135 ms stat-dirty), `diff-files` 19 ms (268 ms), `diff-index HEAD` 19 ms
+(298 ms), `ls-files --others` 11 ms. Limited to the 50 paths status
+reported, `diff-files` took 9.8 ms and `diff-index HEAD` 10.1 ms in the
+stat-dirty case.
+
+Diff loads now run on a loader thread, so the interface keeps responding
+during a slow load (verified by the PTY tests and the stale-result tests;
+input latency during a load was not measured).
+
+Not measured: Linux, Windows, or macOS Intel; the existing `bench_*`
+examples were not rerun for this pass.

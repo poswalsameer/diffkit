@@ -283,6 +283,9 @@ fn intern(old: &[DiffLine], new: &[DiffLine]) -> (Vec<u32>, Vec<u32>, bool) {
 ///    Leftover inserted lines become `Added` rows at the end.
 ///
 /// Both sides stay in order, so line numbers increase down each column.
+///
+/// Each line's [`Profile`] is computed at most once per block, however many
+/// windows it falls in.
 fn pair_block(
     old: &mut [Option<DiffLine>],
     new: &mut [Option<DiffLine>],
@@ -292,15 +295,19 @@ fn pair_block(
     rows: &mut Vec<AlignedRow>,
 ) {
     let mut cursor = 0;
+    let mut profiles: Vec<Option<Profile>> = Vec::new();
+    if !dels.is_empty() {
+        profiles.resize_with(ins.len(), || None);
+    }
     for &d in dels {
         let window_end = ins.len().min(cursor + opts.pairing_window);
         let mut best: Option<(usize, u8)> = None;
-        if let Some(old_line) = &old[d] {
+        if let Some(old_line) = old[d].as_ref().filter(|_| cursor < window_end) {
+            let a = Profile::new(&old_line.content);
             for (j, &i) in ins.iter().enumerate().take(window_end).skip(cursor) {
-                let score = similarity(
-                    &old_line.content,
-                    &new[i].as_ref().expect("unpaired").content,
-                );
+                let new_line = &new[i].as_ref().expect("unpaired").content;
+                let b = profiles[j].get_or_insert_with(|| Profile::new(new_line));
+                let score = a.score(&old_line.content, b, new_line, opts.pairing_threshold);
                 if score >= opts.pairing_threshold && best.is_none_or(|(_, s)| score > s) {
                     best = Some((j, score));
                 }
@@ -347,38 +354,72 @@ const SIMILARITY_PREFIX: usize = 512;
 /// most the first 512 bytes. Identical trimmed lines score 100. Lines too
 /// short for a bigram score 0 unless identical.
 pub fn similarity(a: &[u8], b: &[u8]) -> u8 {
-    let a = a.trim_ascii();
-    let b = b.trim_ascii();
-    if a == b {
-        return 100;
-    }
-    let a = &a[..a.len().min(SIMILARITY_PREFIX)];
-    let b = &b[..b.len().min(SIMILARITY_PREFIX)];
-    if a.len() < 2 || b.len() < 2 {
-        return 0;
-    }
-    let bigrams = |s: &[u8]| {
-        let mut v: Vec<u16> = s
+    Profile::new(a).score(a, &Profile::new(b), b, 0)
+}
+
+/// What [`similarity`] needs from one line, computed once: where its
+/// trimmed content lies, and the sorted bigrams of the compared prefix.
+/// The line's bytes are passed again when scoring, so a profile does not
+/// borrow its line.
+struct Profile {
+    trimmed: std::ops::Range<usize>,
+    /// Empty when the prefix is too short for a bigram.
+    bigrams: Vec<u16>,
+}
+
+impl Profile {
+    fn new(line: &[u8]) -> Self {
+        // The same trimming as `<[u8]>::trim_ascii`, keeping the offsets.
+        let start = line
+            .iter()
+            .position(|b| !b.is_ascii_whitespace())
+            .unwrap_or(line.len());
+        let end = line
+            .iter()
+            .rposition(|b| !b.is_ascii_whitespace())
+            .map_or(start, |i| i + 1);
+        let trimmed = &line[start..end];
+        let prefix = &trimmed[..trimmed.len().min(SIMILARITY_PREFIX)];
+        let mut bigrams: Vec<u16> = prefix
             .windows(2)
             .map(|w| u16::from_be_bytes([w[0], w[1]]))
             .collect();
-        v.sort_unstable();
-        v
-    };
-    let (x, y) = (bigrams(a), bigrams(b));
-    let (mut i, mut j, mut common) = (0, 0, 0usize);
-    while i < x.len() && j < y.len() {
-        match x[i].cmp(&y[j]) {
-            std::cmp::Ordering::Less => i += 1,
-            std::cmp::Ordering::Greater => j += 1,
-            std::cmp::Ordering::Equal => {
-                common += 1;
-                i += 1;
-                j += 1;
-            }
+        bigrams.sort_unstable();
+        Self {
+            trimmed: start..end,
+            bigrams,
         }
     }
-    (200 * common / (x.len() + y.len())) as u8
+
+    /// The [`similarity`] of this profile's `line` and `other`'s
+    /// `other_line`, except that a score that cannot reach `floor` (judged
+    /// from the bigram counts alone) is reported as 0 without counting.
+    fn score(&self, line: &[u8], other: &Profile, other_line: &[u8], floor: u8) -> u8 {
+        if line[self.trimmed.clone()] == other_line[other.trimmed.clone()] {
+            return 100;
+        }
+        let (x, y) = (&self.bigrams, &other.bigrams);
+        if x.is_empty() || y.is_empty() {
+            return 0;
+        }
+        let total = x.len() + y.len();
+        if 200 * x.len().min(y.len()) / total < usize::from(floor) {
+            return 0;
+        }
+        let (mut i, mut j, mut common) = (0, 0, 0usize);
+        while i < x.len() && j < y.len() {
+            match x[i].cmp(&y[j]) {
+                std::cmp::Ordering::Less => i += 1,
+                std::cmp::Ordering::Greater => j += 1,
+                std::cmp::Ordering::Equal => {
+                    common += 1;
+                    i += 1;
+                    j += 1;
+                }
+            }
+        }
+        (200 * common / total) as u8
+    }
 }
 
 #[cfg(test)]
@@ -738,5 +779,79 @@ mod tests {
             100,
             "compares the first 512 bytes"
         );
+    }
+
+    /// The scoring before profiles were introduced, kept as the reference.
+    fn reference_similarity(a: &[u8], b: &[u8]) -> u8 {
+        let (a, b) = (a.trim_ascii(), b.trim_ascii());
+        if a == b {
+            return 100;
+        }
+        let a = &a[..a.len().min(SIMILARITY_PREFIX)];
+        let b = &b[..b.len().min(SIMILARITY_PREFIX)];
+        if a.len() < 2 || b.len() < 2 {
+            return 0;
+        }
+        let mut x: Vec<u16> = a
+            .windows(2)
+            .map(|w| u16::from_be_bytes([w[0], w[1]]))
+            .collect();
+        let mut y: Vec<u16> = b
+            .windows(2)
+            .map(|w| u16::from_be_bytes([w[0], w[1]]))
+            .collect();
+        x.sort_unstable();
+        y.sort_unstable();
+        let mut common = 0;
+        let mut rest = y.clone();
+        for v in &x {
+            if let Some(k) = rest.iter().position(|w| w == v) {
+                rest.remove(k);
+                common += 1;
+            }
+        }
+        (200 * common / (x.len() + y.len())) as u8
+    }
+
+    #[test]
+    fn profiles_score_like_the_reference_and_floors_only_drop_low_scores() {
+        let mut seed: u64 = 0xd1ce;
+        let mut next = |m: u64| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 33) % m
+        };
+        let alphabet = b" \tabcab{}();";
+        let line = |next: &mut dyn FnMut(u64) -> u64| -> Vec<u8> {
+            let len = match next(4) {
+                0 => next(3),
+                1 => next(40),
+                2 => 500 + next(40),
+                _ => next(1200),
+            };
+            (0..len)
+                .map(|_| alphabet[next(alphabet.len() as u64) as usize])
+                .collect()
+        };
+        for _ in 0..3000 {
+            let a = line(&mut next);
+            let b = if next(3) == 0 {
+                a.clone()
+            } else {
+                line(&mut next)
+            };
+            let want = reference_similarity(&a, &b);
+            assert_eq!(similarity(&a, &b), want, "{a:?} {b:?}");
+            let (pa, pb) = (Profile::new(&a), Profile::new(&b));
+            for floor in [0, 40, 90, 100] {
+                let got = pa.score(&a, &pb, &b, floor);
+                if want >= floor {
+                    assert_eq!(got, want, "floor {floor}: {a:?} {b:?}");
+                } else {
+                    assert!(got < floor, "floor {floor}: {a:?} {b:?}");
+                }
+            }
+        }
     }
 }

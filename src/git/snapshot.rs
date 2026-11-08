@@ -44,6 +44,42 @@ pub fn inspect_repository(
     })
 }
 
+/// Like [`inspect_repository`], for a caller that knows no ref or config
+/// changed since `previous` was taken (only working-tree, index, or ignore
+/// rule changes). Status then skips the ahead/behind walk and the upstream
+/// `rev-parse`, and the upstream and counts are taken from `previous`.
+///
+/// They are reused only if HEAD, the branch, and the upstream name read now
+/// match `previous`; otherwise this falls back to [`inspect_repository`]
+/// (one more status call), so a wrong caller costs time, never correctness.
+pub fn inspect_repository_since(
+    repository: crate::git::models::RepositoryInfo,
+    previous: &RepositorySnapshot,
+) -> Result<RepositorySnapshot> {
+    let report = status::read_without_ahead_behind(&repository.root)?;
+    let branch = branches::resolve(&repository.root, &report.headers)?;
+    let upstream_name = report
+        .headers
+        .upstream
+        .as_deref()
+        .map(String::from_utf8_lossy);
+    let same = branch.head == previous.branch.head
+        && branch.head_commit == previous.branch.head_commit
+        && upstream_name.as_deref() == previous.upstream.name();
+    if !same {
+        return inspect_repository(repository);
+    }
+    let operations = state::detect(&repository.git_dir);
+    Ok(RepositorySnapshot {
+        repository,
+        branch,
+        upstream: previous.upstream.clone(),
+        commit_tracking: previous.commit_tracking,
+        status: report.status,
+        operations,
+    })
+}
+
 pub fn inspect_current_dir() -> Result<RepositorySnapshot> {
     inspect(&repository::current_dir()?)
 }

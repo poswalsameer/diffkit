@@ -11,13 +11,16 @@ use super::{
     parser::{Origin, PatchLine, RawHunk},
 };
 
-pub fn build_hunks(raw: &[RawHunk], opts: &AlignmentOptions) -> Result<Vec<DiffHunk>> {
-    let mut prev: Option<&RawHunk> = None;
+/// Consumes the parsed hunks: line text moves into the result instead of
+/// being copied (a context line is copied once, for its second side).
+pub fn build_hunks(raw: Vec<RawHunk>, opts: &AlignmentOptions) -> Result<Vec<DiffHunk>> {
+    // (old end, new end) of the previous hunk.
+    let mut prev: Option<(usize, usize)> = None;
     let mut out = Vec::with_capacity(raw.len());
     for h in raw {
-        if let Some(p) = prev {
-            if first(h.old_start, h.old_count) < end(p.old_start, p.old_count)
-                || first(h.new_start, h.new_count) < end(p.new_start, p.new_count)
+        if let Some((old_end, new_end)) = prev {
+            if first(h.old_start, h.old_count) < old_end
+                || first(h.new_start, h.new_count) < new_end
             {
                 return Err(DiffError::parse(
                     h.patch_line,
@@ -25,8 +28,8 @@ pub fn build_hunks(raw: &[RawHunk], opts: &AlignmentOptions) -> Result<Vec<DiffH
                 ));
             }
         }
+        prev = Some((end(h.old_start, h.old_count), end(h.new_start, h.new_count)));
         out.push(build_hunk(h, opts));
-        prev = Some(h);
     }
     Ok(out)
 }
@@ -49,7 +52,7 @@ fn end(start: usize, count: usize) -> usize {
     }
 }
 
-fn build_hunk(h: &RawHunk, opts: &AlignmentOptions) -> DiffHunk {
+fn build_hunk(h: RawHunk, opts: &AlignmentOptions) -> DiffHunk {
     let mut old_no = h.old_start;
     let mut new_no = h.new_start;
     let mut rows = Vec::with_capacity(h.lines.len());
@@ -66,14 +69,18 @@ fn build_hunk(h: &RawHunk, opts: &AlignmentOptions) -> DiffHunk {
             }
             rows.extend(block);
         };
-    for line in &h.lines {
+    for line in h.lines {
         match line.origin {
             Origin::Context => {
                 flush(&mut removed, &mut added, &mut rows);
+                let new_line = diff_line(line, new_no);
                 rows.push(AlignedRow {
                     kind: DiffRowKind::Context,
-                    old_line: Some(diff_line(line, old_no)),
-                    new_line: Some(diff_line(line, new_no)),
+                    old_line: Some(DiffLine {
+                        line_number: old_no,
+                        ..new_line.clone()
+                    }),
+                    new_line: Some(new_line),
                 });
                 old_no += 1;
                 new_no += 1;
@@ -94,20 +101,22 @@ fn build_hunk(h: &RawHunk, opts: &AlignmentOptions) -> DiffHunk {
         old_count: h.old_count,
         new_start: h.new_start,
         new_count: h.new_count,
-        header: h.header.clone(),
-        section_heading: h.section_heading.clone(),
+        header: h.header,
+        section_heading: h.section_heading,
         rows,
         alignment: quality,
     }
 }
 
-fn diff_line(line: &PatchLine, line_number: usize) -> DiffLine {
-    let (content, ending) = if line.no_newline {
-        (line.text.clone(), LineEnding::None)
-    } else if let Some(c) = line.text.strip_suffix(b"\r") {
-        (c.to_vec(), LineEnding::CrLf)
+fn diff_line(line: PatchLine, line_number: usize) -> DiffLine {
+    let mut content = line.text;
+    let ending = if line.no_newline {
+        LineEnding::None
+    } else if content.last() == Some(&b'\r') {
+        content.pop();
+        LineEnding::CrLf
     } else {
-        (line.text.clone(), LineEnding::Lf)
+        LineEnding::Lf
     };
     DiffLine {
         content,
@@ -187,7 +196,7 @@ mod tests {
 
     fn hunks(patch: &str) -> Vec<DiffHunk> {
         let files = parse_patch(patch.as_bytes()).unwrap();
-        build_hunks(&files[0].hunks, &AlignmentOptions::default()).unwrap()
+        build_hunks(files[0].hunks.clone(), &AlignmentOptions::default()).unwrap()
     }
 
     fn numbers(h: &DiffHunk) -> Vec<(DiffRowKind, Option<usize>, Option<usize>)> {
@@ -268,7 +277,7 @@ mod tests {
             b"diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -5,2 +5,2 @@\n a\n b\n@@ -4,1 +4,1 @@\n c\n",
         )
         .unwrap();
-        assert!(build_hunks(&files[0].hunks, &AlignmentOptions::default()).is_err());
+        assert!(build_hunks(files[0].hunks.clone(), &AlignmentOptions::default()).is_err());
     }
 
     #[test]

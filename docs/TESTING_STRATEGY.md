@@ -148,7 +148,8 @@ Benchmarks: `examples/bench_diff.rs` (see `PERFORMANCE_BUDGET.md`).
   - `tui::keymap`: every documented binding; modifiers and key releases
     don't alias; overlays capture keys.
 - **`tests/tui_app.rs` (17, real repositories):**
-  - Startup runs 6 Git calls and loads no diff; the first load is 1 call.
+  - Startup runs 5 Git calls (the untracked list comes from status) and
+    loads no diff; the first load is 1 call.
   - Selection bounds; empty repository.
   - Comparison switching with partial staging (A→B, B→C, A→C rows).
   - Per-comparison selection memory.

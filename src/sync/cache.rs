@@ -11,10 +11,15 @@
 //!
 //! Memory is bounded by an approximate byte budget. The least recently used
 //! entries are evicted first; the entry currently on screen is never
-//! evicted, so the budget can be exceeded by at most that one entry.
+//! evicted, so the budget can be exceeded by at most that one entry. A
+//! recency index keeps finding the least recently used entry independent of
+//! how many entries there are.
 
 use crate::diff::{DiffComparison, DiffFile, FileId};
-use std::{collections::HashMap, path::PathBuf};
+use std::{
+    collections::{BTreeMap, HashMap},
+    path::PathBuf,
+};
 
 pub const DEFAULT_BUDGET_BYTES: usize = 64 << 20;
 
@@ -57,14 +62,43 @@ struct Entry<V> {
 
 /// Metadata equality ignoring the list-local [`FileId`].
 pub fn same_version(a: &DiffFile, b: &DiffFile) -> bool {
-    let mut b = b.clone();
-    b.id = a.id;
-    *a == b
+    // Exhaustive, so a new field must be considered here.
+    let DiffFile {
+        id: _,
+        comparison,
+        old_path,
+        new_path,
+        kind,
+        old_mode,
+        new_mode,
+        similarity,
+        old_oid,
+        new_oid,
+        binary,
+        stats,
+        conflicted,
+        worktree_stamp,
+    } = a;
+    *comparison == b.comparison
+        && *old_path == b.old_path
+        && *new_path == b.new_path
+        && *kind == b.kind
+        && *old_mode == b.old_mode
+        && *new_mode == b.new_mode
+        && *similarity == b.similarity
+        && *old_oid == b.old_oid
+        && *new_oid == b.new_oid
+        && *binary == b.binary
+        && *stats == b.stats
+        && *conflicted == b.conflicted
+        && *worktree_stamp == b.worktree_stamp
 }
 
 #[derive(Debug)]
 pub struct DiffCache<V> {
     entries: HashMap<CacheKey, Entry<V>>,
+    /// Each entry's `last_used` tick, oldest first.
+    recency: BTreeMap<u64, CacheKey>,
     tick: u64,
     protected: Option<CacheKey>,
     stats: CacheStats,
@@ -74,6 +108,7 @@ impl<V> DiffCache<V> {
     pub fn new(budget_bytes: usize) -> Self {
         Self {
             entries: HashMap::new(),
+            recency: BTreeMap::new(),
             tick: 0,
             protected: None,
             stats: CacheStats {
@@ -116,7 +151,9 @@ impl<V> DiffCache<V> {
         match self.entries.get_mut(key) {
             Some(e) => {
                 self.stats.hits += 1;
+                let k = self.recency.remove(&e.last_used).expect("indexed");
                 e.last_used = self.tick;
+                self.recency.insert(self.tick, k);
                 Some(&e.value)
             }
             None => {
@@ -133,10 +170,9 @@ impl<V> DiffCache<V> {
 
     pub fn insert(&mut self, key: CacheKey, version: &DiffFile, value: V, bytes: usize) {
         self.tick += 1;
-        if let Some(old) = self.entries.remove(&key) {
-            self.stats.bytes -= old.bytes;
-        }
+        self.remove(&key);
         self.stats.bytes += bytes;
+        self.recency.insert(self.tick, key.clone());
         self.entries.insert(
             key,
             Entry {
@@ -156,17 +192,18 @@ impl<V> DiffCache<V> {
     pub fn remove(&mut self, key: &CacheKey) {
         if let Some(e) = self.entries.remove(key) {
             self.stats.bytes -= e.bytes;
+            self.recency.remove(&e.last_used);
         }
     }
 
     fn evict_to_budget(&mut self) {
         while self.stats.bytes > self.stats.budget_bytes {
+            // The protected entry is skipped; it is at most one entry.
             let victim = self
-                .entries
-                .iter()
-                .filter(|(k, _)| Some(*k) != self.protected.as_ref())
-                .min_by_key(|(_, e)| e.last_used)
-                .map(|(k, _)| k.clone());
+                .recency
+                .values()
+                .find(|k| Some(*k) != self.protected.as_ref())
+                .cloned();
             let Some(k) = victim else { break };
             self.remove(&k);
             self.stats.evictions += 1;
@@ -194,6 +231,7 @@ impl<V> DiffCache<V> {
     pub fn clear(&mut self) {
         self.stats.invalidations += self.entries.len() as u64;
         self.entries.clear();
+        self.recency.clear();
         self.stats.bytes = 0;
     }
 }
@@ -344,6 +382,33 @@ mod tests {
         c.clear();
         assert!(c.is_empty());
         assert_eq!((c.stats().bytes, c.stats().invalidations), (0, 1));
+    }
+
+    #[test]
+    fn recency_index_follows_every_operation() {
+        let mut c = cache();
+        let files: Vec<DiffFile> = (0..8)
+            .map(|i| file(DiffComparison::Unstaged, &format!("f{i}"), 1))
+            .collect();
+        for round in 0..200usize {
+            let f = &files[round * 7 % files.len()];
+            match round % 5 {
+                0 | 1 => c.insert(CacheKey::of(f), f, "v", 10 + round % 30),
+                2 => {
+                    c.lookup(&CacheKey::of(f));
+                }
+                3 => c.remove(&CacheKey::of(f)),
+                _ => c.protect(Some(CacheKey::of(f))),
+            }
+            assert_eq!(c.recency.len(), c.entries.len(), "round {round}");
+            for (tick, k) in &c.recency {
+                assert_eq!(c.entries[k].last_used, *tick, "round {round}");
+            }
+            assert_eq!(
+                c.stats().bytes,
+                c.entries.values().map(|e| e.bytes).sum::<usize>()
+            );
+        }
     }
 
     #[test]

@@ -67,6 +67,11 @@ impl ChangeSet {
         self.0 |= other.0;
     }
 
+    /// `self | other`, usable in constants.
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
     pub fn names(self) -> Vec<&'static str> {
         Self::NAMES
             .iter()
