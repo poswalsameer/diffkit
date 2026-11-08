@@ -15,9 +15,10 @@
 //! Fixture setup runs writing Git commands; Diffkit does not.
 
 use diffkit::{
-    diff::{DiffComparison, DiffEngine, DiffOptions},
+    diff::engine::DiffEngine,
     git::commands::thread_invocations,
-    tui::{diff_view::DiffView, ui, Action, App},
+    tui::{actions::Action, app::App, diff_view::DiffView, ui},
+    types::diff::{DiffComparison, DiffOptions},
 };
 use ratatui::{backend::TestBackend, layout::Rect, Terminal};
 use std::{

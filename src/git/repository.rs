@@ -1,10 +1,14 @@
 //! Repository discovery: root, Git directory, common directory, worktree
 //! kind, shallowness, and object format, all resolved by Git itself.
 
-use super::{
-    commands,
-    errors::{GitError, Result},
-    models::{ObjectFormat, RepositoryInfo, RepositoryKind},
+use crate::{
+    git::{
+        commands,
+        errors::{GitError, Result},
+        paths,
+    },
+    helpers::git_text::strip_newline,
+    types::repository::{ObjectFormat, RepositoryInfo, RepositoryKind},
 };
 use std::path::{Path, PathBuf};
 
@@ -59,9 +63,7 @@ pub fn discover_from(start: &Path) -> Result<RepositoryInfo> {
     args.push(FORMAT);
     args.extend(PATHS);
     let out = commands::output(&cwd, &args)?;
-    let lines: Vec<&[u8]> = commands::strip_newline(&out.stdout)
-        .split(|&b| b == b'\n')
-        .collect();
+    let lines: Vec<&[u8]> = strip_newline(&out.stdout).split(|&b| b == b'\n').collect();
     if !out.status.success() {
         return Err(classify_failure(&cwd, &args, &out, lines.first().copied()));
     }
@@ -101,7 +103,7 @@ pub fn discover_from(start: &Path) -> Result<RepositoryInfo> {
             .iter()
             .map(|p| {
                 let out = commands::run(&cwd, &["rev-parse", "--path-format=absolute", p])?;
-                absolute(&cwd, commands::strip_newline(&out))
+                absolute(&cwd, strip_newline(&out))
             })
             .collect::<Result<Vec<_>>>()?
     };
@@ -129,7 +131,7 @@ fn absolute(cwd: &Path, bytes: &[u8]) -> Result<PathBuf> {
     if bytes.is_empty() {
         return Err(GitError::malformed("rev-parse", "empty path"));
     }
-    let p = commands::path_from_git(bytes)?;
+    let p = paths::path_from_git(bytes)?;
     // `--path-format=absolute` should make this a no-op; it guards against
     // a Git that prints a path relative to the working directory.
     Ok(if p.is_absolute() { p } else { cwd.join(p) })

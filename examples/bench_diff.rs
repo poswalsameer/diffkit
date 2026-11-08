@@ -17,8 +17,9 @@
 //! are the benchmark's own, never the engine's.
 
 use diffkit::{
-    diff::{self, DiffComparison, DiffEngine, DiffOptions},
+    diff::{self, engine::DiffEngine},
     git::{self, commands::thread_invocations},
+    types::diff::{AlignmentQuality, DiffComparison, DiffOptions},
 };
 use std::{
     ffi::OsStr,
@@ -342,7 +343,7 @@ fn main() {
         let quality = loaded
             .hunks()
             .iter()
-            .any(|h| h.alignment == diff::AlignmentQuality::Bounded);
+            .any(|h| h.alignment == AlignmentQuality::Bounded);
         println!(
             "| {name} | {change} | {} | {load:.2} ms | {git_ms:.2} ms | {parse_ms:.2} ms | {build_ms:.2} ms | {} | {} |",
             f.stats.map_or("binary".into(), |s| format!("+{} -{}", s.added, s.removed)),

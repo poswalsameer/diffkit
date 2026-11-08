@@ -4,16 +4,18 @@
 
 use super::{sidebar::file_label, theme};
 use crate::{
-    diff::{
-        ConflictInfo, DiffComparison, DiffRowKind, FileChangeKind, FileMode, SubmoduleChange,
-        SubmoduleWorktree,
-    },
-    display::{display_path, escape_text, truncate_start},
-    git::models::{ConflictStage, FileKind, FileStatus},
+    helpers::display::{display_path, escape_text, truncate_start},
     tui::{
         app::{App, FailureKind, Loaded},
         diff_view::{Body, Cell, DiffView, Notice, ViewRow, CRLF_MARK, NO_NEWLINE_MARK},
         layout,
+    },
+    types::{
+        diff::{
+            ConflictInfo, DiffComparison, DiffRowKind, FileChangeKind, FileMode, SubmoduleChange,
+            SubmoduleWorktree,
+        },
+        repository::{ConflictStage, FileKind, FileStatus},
     },
 };
 use ratatui::{
@@ -230,7 +232,7 @@ fn conflict_lines(c: &ConflictInfo) -> Vec<Line<'static>> {
 }
 
 fn submodule_lines(s: &SubmoduleChange, status: Option<&FileStatus>) -> Vec<Line<'static>> {
-    let id = |c: &Option<crate::git::models::ObjectId>, none: &str| {
+    let id = |c: &Option<crate::types::repository::ObjectId>, none: &str| {
         c.as_ref()
             .map_or(none.to_string(), |c| c.as_str()[..12].to_string())
     };
@@ -337,7 +339,7 @@ fn notice_lines(app: &App, v: &DiffView, notice: &Notice) -> Vec<Line<'static>> 
                 FileChangeKind::Added | FileChangeKind::Deleted => {
                     "Empty file (no lines).".to_string()
                 }
-                _ if f.comparison == crate::diff::DiffComparison::Untracked => {
+                _ if f.comparison == crate::types::diff::DiffComparison::Untracked => {
                     "Empty file (no lines).".to_string()
                 }
                 _ => "No line changes.".to_string(),
@@ -490,9 +492,11 @@ fn cell_line(cell: Option<&Cell>, style: Style) -> Line<'_> {
         })
         .collect();
     match c.ending {
-        crate::diff::LineEnding::None => spans.push(Span::styled(NO_NEWLINE_MARK, theme::muted())),
-        crate::diff::LineEnding::CrLf => spans.push(Span::styled(CRLF_MARK, theme::muted())),
-        crate::diff::LineEnding::Lf => {}
+        crate::types::diff::LineEnding::None => {
+            spans.push(Span::styled(NO_NEWLINE_MARK, theme::muted()))
+        }
+        crate::types::diff::LineEnding::CrLf => spans.push(Span::styled(CRLF_MARK, theme::muted())),
+        crate::types::diff::LineEnding::Lf => {}
     }
     Line::from(spans)
 }

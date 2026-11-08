@@ -2,48 +2,83 @@
 
 Run everything with `cargo test`. Tests use only Rust's built-in harness.
 
-## Unit tests (`src/**`, `#[cfg(test)]`)
+## Layout
+
+Every automated test lives in `tests/`; production files contain no
+`#[cfg(test)]` code. Tests reach the library only through its public
+interface, and the binary through `CARGO_BIN_EXE_diffkit`.
+
+| Target | Covers |
+|---|---|
+| `tests/git.rs` + `tests/git/` | `diffkit::git`: discovery, status, branches, upstreams, ahead/behind, conflicts, renames, submodules, symlinks, operations, history, errors, read-only and offline guarantees |
+| `tests/diff.rs` + `tests/diff/` | `diffkit::diff`: comparisons, lazy loading, paths, special files, untracked files, patch parsing, hunks, alignment |
+| `tests/sync.rs` + `tests/sync/` | `diffkit::sync`: classification, debouncing, the worker, reconciliation, the cache, the real watcher, consistency under concurrent Git |
+| `tests/tui.rs` + `tests/tui/` | `diffkit::tui`: application state, keys, layout, rendering, history screen, sync results, real pseudo-terminal sessions |
+| `tests/cli.rs` + `tests/cli/` | `diffkit::cli` and the binary: argument parsing, `inspect`, `diff-stats` |
+| `tests/types.rs` + `tests/types/` | `diffkit::types`: repository model predicates and labels |
+| `tests/helpers.rs` + `tests/helpers/` | `diffkit::helpers`: display escaping and truncation, Git text conventions |
+| `tests/panic_hook.rs` | The panic hook; its own target because panic hooks are process-wide |
+
+Each target's root file declares `mod support;` (shared fixtures in
+`tests/support/mod.rs`, the one `mod.rs`: a `tests/support.rs` would be
+compiled as a test target of its own) and an inline `mod <feature> { … }`
+listing the files in its folder. Run one area with `cargo test --test sync`,
+or one file with a filter: `cargo test --test sync watch::`.
+
+## Fixture tests (pure logic)
 
 Pure logic with hand-written inputs, focused on what real Git output cannot
-easily produce:
+easily produce. These were unit tests inside `src/` until the
+restructure; they now use only public functions, and the few that checked
+private details were rewritten to check the same behavior through public
+ones.
 
-- `git::status` — every record type, rename/copy original-path pairing,
-  paths with spaces/tabs/newlines, raw non-UTF-8 bytes (Unix), submodule
-  fields, unknown status letters, ignored records, and a table of malformed
-  inputs that must return errors instead of panicking.
-- `git::branches` — header interpretation for normal, detached, unborn,
-  and unknown HEAD; malformed object IDs.
-- `git::commits` — `branch.ab` parsing (including `+? -?` and malformed
-  values) and the mapping from upstream state to tracking availability.
-- `git::models` — staged/unstaged/partial predicates over a table of XY
-  codes, counts, tracking relation, object ID validation.
-- `git::commands` / `git::errors` — newline stripping that keeps other
-  whitespace, path conversion per platform (Windows tests are
-  `#[cfg(windows)]`), error messages.
-- `app::report` — path escaping and rendering of partially staged files,
-  untracked tracking, and the staleness disclaimer.
+- `git/status_records.rs` — every record type, rename/copy original-path
+  pairing, paths with spaces/tabs/newlines, raw non-UTF-8 bytes (Unix),
+  submodule fields, unknown status letters, ignored records, and a table of
+  malformed inputs that must return errors instead of panicking.
+- `git/branch_headers.rs` — header interpretation for normal, detached,
+  unborn, and unknown HEAD; malformed object IDs.
+- `git/ahead_behind.rs` — `branch.ab` parsing (including `+? -?` and
+  malformed values) and the mapping from upstream state to tracking
+  availability.
+- `types/repository.rs` — staged/unstaged/partial predicates over a table
+  of XY codes, counts, tracking relation, object ID validation.
+- `git/commands.rs`, `git/error_messages.rs`, `helpers/git_text.rs` —
+  newline stripping that keeps other whitespace, path conversion per
+  platform (Windows tests are `#[cfg(windows)]`), error messages.
+- `helpers/display.rs` — path quoting and escaping, content sanitizing,
+  width-aware truncation.
+- `cli/inspect_report.rs` — rendering of partially staged files, untracked
+  tracking, the staleness disclaimer, operations, and conflict stages.
+- `cli/args.rs` — every accepted command line and the usage errors.
+- `diff/parser.rs`, `diff/hunk.rs`, `diff/discovery.rs`, `diff/commands.rs`,
+  `diff/alignment.rs` (including agreement with a reference
+  implementation of line pairing), `sync/classifier.rs`,
+  `sync/debounce.rs`, `sync/cache.rs` (eviction checked against a model),
+  `sync/watcher.rs`, `tui/keymap.rs`, `tui/layout.rs`.
 
-## Integration tests (`tests/*.rs`)
+## Integration tests (real repositories)
 
 Each test builds its own repositories with the real `git` executable and
 asserts on the parsed model or the CLI output, never just on exit codes.
 
 | File | Covers |
 |---|---|
-| `repository_discovery.rs` | Root, nested levels, `.git` dir vs file, linked and multiple worktrees, spaces/Unicode in repo paths, shallow clone, non-repo, bare repo, `.git` dir, missing path |
-| `git_status.rs` | Clean; `.M M. MM MD A. AM AD .A D. .D R. RM RD .R C. .T T.`; chmod; multiple/nested untracked; ignored files; tracked-but-ignored; submodule `S` field; combined matrix counts |
-| `branch_detection.rs` | Normal, detached, empty, unborn with custom name, orphan, slash and unusual names, external switches, HEAD hash |
-| `upstream_detection.rs` | Available, slash branches, none, no remote, never-fetched ref, deleted-and-pruned upstream, local-branch upstream, detached, unborn with upstream |
-| `commit_tracking.rs` | Identical, ahead 1/3, behind 1/4, diverged 2/3, merge commit, back-dated commits, no upstream, missing ref, stale ref, deleted upstream, detached, shallow — every count cross-checked with `git rev-list --left-right --count` |
-| `repository_states.rs` | UU; UU+UD+DU+AA at once; DD/AU/UA from a rename/rename conflict; conflict resolution; rebase conflict (detached); full snapshot coherence; empty repository snapshot |
-| `unusual_filenames.rs` | Spaces, leading/trailing spaces, tab, newline, CR, quotes, backslash, `#;&%`, leading dash, ` -> `, glob characters, NFC Unicode, CJK, emoji — as untracked, staged, modified, and renamed (both paths); non-UTF-8 names; CLI escaping |
-| `error_handling.rs` | Not a repo, broken `.git` pointer, corrupt index, corrupt HEAD, Git missing from PATH, Git not executable, permission-denied directories, nonexistent directory, malformed output, expected states that are not errors |
-| `cli_inspect.rs` | Help/version/default, usage errors, and output for clean, dirty, conflicted, detached, empty, no-upstream, missing-upstream, nested, and linked-worktree cases, plus a closed stdout pipe |
-| `read_only.rs` | Byte-level before/after fingerprints with a positive control, partial-clone no-fetch with a positive control, a logging Git wrapper that audits every invocation, and a source audit of spawn sites |
+| `git/discovery.rs` | Root, nested levels, `.git` dir vs file, linked and multiple worktrees, spaces/Unicode in repo paths, shallow clone, non-repo, bare repo, `.git` dir, missing path |
+| `git/status.rs` | Clean; `.M M. MM MD A. AM AD .A D. .D R. RM RD .R C. .T T.`; chmod; multiple/nested untracked; ignored files; tracked-but-ignored; submodule `S` field; combined matrix counts |
+| `git/branches.rs` | Normal, detached, empty, unborn with custom name, orphan, slash and unusual names, external switches, HEAD hash |
+| `git/upstream.rs` | Available, slash branches, none, no remote, never-fetched ref, deleted-and-pruned upstream, local-branch upstream, detached, unborn with upstream |
+| `git/tracking.rs` | Identical, ahead 1/3, behind 1/4, diverged 2/3, merge commit, back-dated commits, no upstream, missing ref, stale ref, deleted upstream, detached, shallow — every count cross-checked with `git rev-list --left-right --count` |
+| `git/states.rs` | UU; UU+UD+DU+AA at once; DD/AU/UA from a rename/rename conflict; conflict resolution; rebase conflict (detached); full snapshot coherence; empty repository snapshot |
+| `git/filenames.rs` | Spaces, leading/trailing spaces, tab, newline, CR, quotes, backslash, `#;&%`, leading dash, ` -> `, glob characters, NFC Unicode, CJK, emoji — as untracked, staged, modified, and renamed (both paths); non-UTF-8 names; CLI escaping |
+| `git/errors.rs` | Not a repo, broken `.git` pointer, corrupt index, corrupt HEAD, Git missing from PATH, Git not executable, permission-denied directories, nonexistent directory, malformed output, expected states that are not errors |
+| `cli/inspect.rs` | Help/version/default, usage errors, and output for clean, dirty, conflicted, detached, empty, no-upstream, missing-upstream, nested, and linked-worktree cases, plus a closed stdout pipe |
+| `git/read_only.rs` | Byte-level before/after fingerprints with a positive control, partial-clone no-fetch with a positive control, a logging Git wrapper that audits every invocation, and a source audit of spawn sites |
 
 ### Temporary repositories
 
-`tests/common/mod.rs` provides `TempDir` (a unique directory under
+`tests/support/mod.rs` provides `TempDir` (a unique directory under
 `$TMPDIR/diffkit-tests`, removed on drop), `Repo` (init, bare init, clone,
 write, remove, commit, rev-parse, `rev_list_counts`, snapshot), `Remote` (a
 work repository tracking a local bare remote, plus a second clone that can
@@ -122,13 +157,13 @@ see `PERFORMANCE_BUDGET.md`.
 
 | File | Covers |
 |---|---|
-| `diff_comparisons.rs` | Clean repository; partial staging asserting HEAD→index, index→worktree, HEAD→worktree rows, line numbers, and object IDs; combined ≠ sum; independent line numbers; staged addition and deletion; unstaged deletion; renames with and without edits; copies; mode-only and mode+content changes; separated hunks with context 0/3/20; multiple files; unborn HEAD (empty-tree base); a 50,000-line file with 50 hunks; exact subprocess counts; stat-only files dropped without an index write |
-| `diff_special_files.rs` | Binary add, modify, and delete (with sizes); symlink target change; file → symlink type change; empty files; missing final newline; CRLF and mixed endings; non-UTF-8 content; conflicts in staged and unstaged (`Unmerged`, `load_all` clean) and combined (flagged); submodule commit and dirty state |
-| `diff_untracked.rs` | Text, empty, no-EOL, CRLF, binary, Unicode, nested; ignored files and `info/exclude`; no index or object writes; size limit; vanished and changed files; symlinks not followed; directory swapped for an outside symlink refused; unreadable files; nested repositories; non-UTF-8 names (skipped on APFS) |
-| `diff_lazy_loading.rs` | Discovery metadata vs loaded content; restaged file (`ObjectChanged`); edited or deleted working-tree file (`WorkingTreeChanged`); reverted change (`MissingFromDiff`); `load_all` equals per-file loads and reports new changes; unknown `FileId`; per-file and total patch limits with fallback |
-| `diff_paths.rs` | 13 hostile names (spaces, tab, newline, quotes, backslash, leading dash, ` -> `, glob characters, pathspec magic `:(attr:…)`, `:!`, Unicode, emoji) in all three comparisons and through `load_all`; renames keeping both unusual paths; a non-UTF-8 tracked path via the index; a portable Unicode subset |
-| `diff_read_only.rs` | Byte-level fingerprints unchanged after `diff-stats --load` and every API call; `diff.external` and textconv never run, with a positive control; Git invocation audit of `diff-stats --load` |
-| `diff_cli.rs` | `diffkit diff-stats` and `--load` output; errors and usage |
+| `diff/comparisons.rs` | Clean repository; partial staging asserting HEAD→index, index→worktree, HEAD→worktree rows, line numbers, and object IDs; combined ≠ sum; independent line numbers; staged addition and deletion; unstaged deletion; renames with and without edits; copies; mode-only and mode+content changes; separated hunks with context 0/3/20; multiple files; unborn HEAD (empty-tree base); a 50,000-line file with 50 hunks; exact subprocess counts; stat-only files dropped without an index write |
+| `diff/special_files.rs` | Binary add, modify, and delete (with sizes); symlink target change; file → symlink type change; empty files; missing final newline; CRLF and mixed endings; non-UTF-8 content; conflicts in staged and unstaged (`Unmerged`, `load_all` clean) and combined (flagged); submodule commit and dirty state |
+| `diff/untracked.rs` | Text, empty, no-EOL, CRLF, binary, Unicode, nested; ignored files and `info/exclude`; no index or object writes; size limit; vanished and changed files; symlinks not followed; directory swapped for an outside symlink refused; unreadable files; nested repositories; non-UTF-8 names (skipped on APFS) |
+| `diff/lazy_loading.rs` | Discovery metadata vs loaded content; restaged file (`ObjectChanged`); edited or deleted working-tree file (`WorkingTreeChanged`); reverted change (`MissingFromDiff`); `load_all` equals per-file loads and reports new changes; unknown `FileId`; per-file and total patch limits with fallback |
+| `diff/paths.rs` | 13 hostile names (spaces, tab, newline, quotes, backslash, leading dash, ` -> `, glob characters, pathspec magic `:(attr:…)`, `:!`, Unicode, emoji) in all three comparisons and through `load_all`; renames keeping both unusual paths; a non-UTF-8 tracked path via the index; a portable Unicode subset |
+| `diff/read_only.rs` | Byte-level fingerprints unchanged after `diff-stats --load` and every API call; `diff.external` and textconv never run, with a positive control; Git invocation audit of `diff-stats --load` |
+| `cli/diff_stats.rs` | `diffkit diff-stats` and `--load` output; errors and usage |
 
 Platform-dependent coverage: on-disk non-UTF-8 names log `SKIPPED` on APFS.
 Non-UTF-8 tracked paths are exercised through the index instead.
@@ -147,7 +182,7 @@ Benchmarks: `examples/bench_diff.rs` (see `PERFORMANCE_BUDGET.md`).
     narrow-panel requirement.
   - `tui::keymap`: every documented binding; modifiers and key releases
     don't alias; overlays capture keys.
-- **`tests/tui_app.rs` (17, real repositories):**
+- **`tests/tui/app.rs` (17, real repositories):**
   - Startup runs 5 Git calls (the untracked list comes from status) and
     loads no diff; the first load is 1 call.
   - Selection bounds; empty repository.
@@ -164,7 +199,7 @@ Benchmarks: `examples/bench_diff.rs` (see `PERFORMANCE_BUDGET.md`).
   - Resizing keeps scroll valid; sidebar hide and resize.
   - A full flow over rename, deletion, binary, conflict, and untracked files
     in all four modes.
-- **`tests/tui_render.rs` (14, `TestBackend`):**
+- **`tests/tui/render.rs` (14, `TestBackend`):**
   - All regions at 120×40 and 80×24.
   - Numbers, markers, and colors of context, modified, and inserted rows.
   - One-sided added and deleted files.
@@ -177,16 +212,16 @@ Benchmarks: `examples/bench_diff.rs` (see `PERFORMANCE_BUDGET.md`).
   - Horizontal scrolling with fixed gutters.
   - Escape sequences in content and filenames never reach the buffer.
   - Header tracking and detached states.
-- **`tests/tui_cli.rs` (4):**
+- **`tests/tui/terminal.rs` (4):**
   - Argument routing without a TTY.
   - Real pseudo-terminal sessions through `script(1)` (macOS/Linux): launch,
     keys, quit with exit 0, the alternate screen left and cursor shown last,
     no cursor-position query, explicit path argument, and repository errors
     printed before the terminal is touched.
-- **`tests/tui_panic.rs` (1):** the panic hook chains to the previous hook
+- **`tests/panic_hook.rs` (1):** the panic hook chains to the previous hook
   (its own binary, since hooks are global).
 
-Phase 1's `cli_inspect::help_version_and_default` was updated for the one
+Phase 1's `cli::inspect::help_version_and_default` was updated for the one
 intended behavior change: `diffkit` with no arguments now opens the viewer,
 and without a terminal exits 1 with a message. The `--help`, `-h`, and
 `--version` assertions are unchanged.
@@ -212,7 +247,7 @@ Benchmarks: `examples/bench_tui.rs`.
   - `watcher`: a full queue counts drops and never blocks; watch plans for
     standard and linked repositories.
   - `reconcile`: reuse rules.
-- **`tests/sync_scheduler.rs` (8, scripted reconciler, no watcher):**
+- **`tests/sync/scheduler.rs` (8, scripted reconciler, no watcher):**
   - One run for a 100-event burst (99 coalesced).
   - Events during a run are kept and the next run includes them; never two
     runs at once.
@@ -222,14 +257,14 @@ Benchmarks: `examples/bench_tui.rs`.
   - Dropped events force a full OVERFLOW run.
   - Shutdown during the debounce is prompt; shutdown never hangs on a busy
     worker.
-- **`tests/sync_reconcile.rs` (5, real Git):**
+- **`tests/sync/reconcile.rs` (5, real Git):**
   - A refs-only change reuses all four lists (2 Git calls).
   - A working-tree change reuses only Staged.
   - A moved HEAD never reuses.
   - INDEX, MANUAL, and OVERFLOW rediscover.
   - Ignored directories: only directories that are themselves ignored,
     including a pathspec-magic-looking name.
-- **`tests/sync_watch.rs` (11, real watcher + Git):**
+- **`tests/sync/watch.rs` (11, real watcher + Git):**
   - Editing; staging and unstaging; untracked files appearing and
     disappearing; deletion and rename.
   - External commit and branch switch; conflict introduced and resolved.
@@ -239,7 +274,7 @@ Benchmarks: `examples/bench_tui.rs`.
   - Linked worktree: its tree, its HEAD, and a shared ref moved from the
     main worktree.
   - `.git` stays byte-for-byte unchanged while syncing.
-- **`tests/tui_sync.rs` (10):**
+- **`tests/tui/sync.rs` (10):**
   - Unrelated changes keep the selection and cached diffs (1
     invalidation; 0 Git calls to show the kept file).
   - The viewed file changing reloads it and keeps the scroll position.
@@ -251,14 +286,14 @@ Benchmarks: `examples/bench_tui.rs`.
   - Diagnostics overlay.
   - The interface stays responsive (200 actions and frames) while a
     reconciliation is blocked.
-- **`tests/tui_cli.rs` (+2 real-PTY sessions):**
+- **`tests/tui/terminal.rs` (+2 real-PTY sessions):**
   - An external edit and a new file appear without `r`; `Synced` shown;
     the terminal is restored; exit within 3 s.
   - A Git audit of the running viewer (edits, an external `git add`, `r`):
     only allowed read-only subcommands, `GIT_OPTIONAL_LOCKS=0` on every
     call.
 
-Changed Phase 3 assertion: `tui_app::refresh_keeps_selection_by_identity`
+Changed Phase 3 assertion: `tui::app::refresh_keeps_selection_by_identity`
 expected refresh to clear the cache. It now expects unchanged files to keep
 their cached diffs, which is Phase 4's targeted invalidation.
 
@@ -287,14 +322,14 @@ difference.
   - commit-range arguments;
   - bisect classification;
   - the `inspect` report's operations and conflict stages.
-- **`tests/advanced_conflicts.rs` (5):**
+- **`tests/git/conflicts.rs` (5):**
   - `UU`, `AA`, `UD`, and `DU` stages match `git ls-files --unmerged`
     exactly;
   - working-tree presence;
   - conflicts versus ordinary edits;
   - `inspect` stages;
   - the interface's conflict panel.
-- **`tests/advanced_renames.rs` (5):**
+- **`tests/git/renames.rs` (5):**
   - renames across directories, with and without edits, in Staged and
     Combined;
   - an unrelated delete + add is not a rename;
@@ -302,18 +337,18 @@ difference.
     newline);
   - renames in commits;
   - a case-only rename on a case-insensitive file system.
-- **`tests/advanced_submodules.rs` (5):** moved submodule commit,
+- **`tests/git/submodules.rs` (5):** moved submodule commit,
   uninitialized submodule, missing directory, embedded repository
   (gitlink without `.gitmodules`), untracked nested repository. Files
   inside are never listed and the submodule is never initialized.
-- **`tests/advanced_symlinks.rs` (4, Unix):**
+- **`tests/git/symlinks.rs` (4, Unix):**
   - target change;
   - broken links, tracked and untracked;
   - a link to a secret outside the repository (only the path is shown,
     never the content);
   - deletion and replacement by a regular file;
   - a regular file holding a path-like string.
-- **`tests/repository_operations.rs` (11):**
+- **`tests/git/operations.rs` (11):**
   - merge (and abort);
   - rebase with the sequencer backend (step, branch, onto), interactive
     rebase stopped by `exec`, and the apply backend;
@@ -323,7 +358,7 @@ difference.
   - detached and unborn HEAD;
   - a `.git` file pointing nowhere, and an unreadable `.git` (Unix);
   - the real watcher publishing operation changes.
-- **`tests/history.rs` (8):**
+- **`tests/git/history.rs` (8):**
   - commit metadata checked against Git (Unicode identities, explicit
     dates);
   - every change kind in a commit diff;
@@ -334,7 +369,7 @@ difference.
     `--all`, out of range, a blob, a tree, a range) and four valid ones;
   - `diffkit show` output, escaping, and exit codes;
   - a logging-wrapper audit of every Git process `show` starts.
-- **`tests/tui_history.rs` (6):**
+- **`tests/tui/history.rs` (6):**
   - inspect a commit and return to the identical working-tree view
     (comparison, file, scroll);
   - synchronization while history is open;
@@ -342,15 +377,15 @@ difference.
   - empty, merge, and shallow-boundary commits;
   - escape sequences in messages and author names;
   - tiny sizes and reload.
-- **`tests/tui_states.rs` (3):**
+- **`tests/tui/states.rs` (3):**
   - bidi and zero-width characters in branch and file names never reach
     a cell;
   - hunk and scroll keys on notice-only views;
   - very long names and subjects at widths 40–250.
-- **`tests/platform_paths.rs` (2):** a repository and a linked worktree
+- **`tests/sync/platform_paths.rs` (2):** a repository and a linked worktree
   under directories with spaces, accents, CJK, and emoji, through the
   interface, the CLI, and the real watcher.
-- **`tests/sync_consistency.rs` (1):** a stress test.
+- **`tests/sync/consistency.rs` (1):** a stress test.
   - A thread changes the index, HEAD, and refs in bursts while
     reconciliations run.
   - Every settled result must agree with itself (status versus each list,
@@ -358,9 +393,9 @@ difference.
   - Across five runs, every settled result was consistent, while 12 to 18
     of the roughly 32 unsettled results per run were truly mixed. Those
     are what the guard keeps from being published.
-- **`tests/sync_scheduler.rs` (+1):** an unsettled result is withheld and
+- **`tests/sync/scheduler.rs` (+1):** an unsettled result is withheld and
   followed by a full run.
-- **`tests/tui_cli.rs` (+2 real PTY sessions, 1 extended):**
+- **`tests/tui/terminal.rs` (+2 real PTY sessions, 1 extended):**
   - SIGTERM, SIGHUP, and SIGINT restore the terminal and exit with
     128 + N within 3 s;
   - a scripted history session;
@@ -369,13 +404,13 @@ difference.
     `--no-show-signature` in the arguments.
 
 Changed assertions in earlier tests (none weakened):
-- `diff_special_files::conflicts_are_explicit_in_staged_and_unstaged`
+- `diff::special_files::conflicts_are_explicit_in_staged_and_unstaged`
   still requires no two-way diff, and now also requires the right kind,
   all three stages, and working-tree presence.
 - `tui_app` matches `Notice::Unmerged(_)` instead of `Notice::Unmerged`.
-- `tui_render::header_shows_tracking_and_detached_states` expects the new
+- `tui::render::header_shows_tracking_and_detached_states` expects the new
   wording "(remote-tracking ref, as last fetched)".
-- `tui_cli::interactive_sync_runs_only_read_only_git_commands` gained
+- `tui::terminal::interactive_sync_runs_only_read_only_git_commands` gained
   history steps, two allowed subcommands, and argument checks.
 
 PTY transcript matching: differential redraws leave unchanged cells

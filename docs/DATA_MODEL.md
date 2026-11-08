@@ -1,6 +1,7 @@
 # Data Model
 
-All types live in `src/git/models.rs`. They carry no formatting logic.
+All types live in `src/types/repository.rs` (`diffkit::types::repository`).
+They carry no formatting logic.
 
 ## RepositorySnapshot
 
@@ -133,8 +134,9 @@ layers can interpret them. Unknown headers (e.g. `# stash`) are ignored.
 
 # Phase 2 — Diff Models
 
-All types live in `src/diff/models.rs` and are re-exported from
-`diffkit::diff`.
+All types live in `src/types/diff.rs` (`diffkit::types::diff`), except
+`LoadedFile` and `DiffCollection`, which only the engine produces and which
+live in `diffkit::diff::engine`.
 
 ## Comparison and identity
 

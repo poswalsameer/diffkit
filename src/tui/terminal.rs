@@ -33,7 +33,7 @@ use super::{
     app::{App, LoadJob, LoadResult},
     keymap, ui,
 };
-use crate::sync::{GitReconciler, SyncConfig, SyncEvent, SyncService};
+use crate::sync::scheduler::{GitReconciler, SyncConfig, SyncEvent, SyncService};
 use crossterm::{
     cursor,
     event::{self, Event},

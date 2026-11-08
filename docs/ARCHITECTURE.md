@@ -1,66 +1,100 @@
 # Architecture
 
-Diffkit is a library crate (`src/lib.rs`, modules `git` and `diff`) plus a
-binary (`src/main.rs`, module `app`). The library owns everything about Git;
-the binary owns argument handling and presentation.
+Diffkit is one library crate (`src/lib.rs`) and a thin binary
+(`src/main.rs`) that passes its arguments to `diffkit::cli::run` and exits
+with the code it returns. All behavior lives in the library, so every test
+in `tests/` drives it through its public interface.
+
+Modules follow the `name.rs` + `name/` convention (no `mod.rs`). Each
+feature owns its logic and its own types; data read by several features
+lives in `types`, and pure utilities used by several features in `helpers`.
+There is no async code: background work runs on plain threads owned by the
+feature that needs them (`sync`, `tui`).
 
 ```text
 src/
-  main.rs            entry point: passes argv to app::cli and exits with its code
-  lib.rs             exposes `git`, `diff`, `display`, `sync`, and `tui`
-  display.rs         safe display text: path quoting, content sanitizing, truncation
-  app/
-    cli.rs           argument parsing, dispatch, stdout/stderr, exit codes
-    report.rs        formats a RepositorySnapshot as the text report
-    diff_stats.rs    `diffkit diff-stats [--load]` diagnostic (Phase 2)
-    show.rs          `diffkit show <COMMIT>` (Phase 5)
-  git/
-    commands.rs      the only place a process is started
-    errors.rs        GitError and Result
-    models.rs        typed state shared by all layers
-    repository.rs    repository discovery
-    status.rs        porcelain v2 reading and byte-level parsing
-    branches.rs      branch, HEAD, and upstream resolution
-    commits.rs       ahead/behind tracking
-    snapshot.rs      assembles one RepositorySnapshot
-    state.rs         operations in progress, from Git's state files (Phase 5)
-    history.rs       recent commits, commit metadata, revision resolution (Phase 5)
-  diff/              Phase 2 diff engine
-    engine.rs        DiffEngine: discover / load_file_diff / load_all, staleness checks
-    commands.rs      argument arrays for diff-index, diff-files, ls-files, cat-file
-    discovery.rs     --raw --numstat -z parsing and DiffFile construction
-    parser.rs        byte-oriented unified diff parser
-    hunk.rs          line numbering, line endings, hunk validation, untracked hunks
-    alignment.rs     Myers (linear space, bounded) + line pairing → AlignedRow
-    binary.rs        binary heuristic for untracked files, blob sizes
-    untracked.rs     safe discovery and reading of untracked files
-    models.rs        diff data model
-    errors.rs        DiffError
-  sync/              Phase 4 synchronization: watcher, classifier, debounce,
-                     reconcile, scheduler (worker thread), diff cache
-  tui/               Phase 3 terminal interface (Ratatui + Crossterm)
-    app.rs           App state and updates; the only TUI code that calls the engines
-    actions.rs       Action enum
-    keymap.rs        key events → actions
-    diff_view.rs     display rows built once per loaded diff
-    layout.rs        pure screen geometry
-    terminal.rs      terminal guard, panic hook, event loop
-    ui/              rendering: header, sidebar, diff_panel, status, overlays, theme
+  main.rs              entry point: diffkit::cli::run(argv) → exit code
+  lib.rs               declares the modules below
+  cli.rs               dispatch, stdout/stderr, exit codes
+  cli/
+    args.rs            argument parsing into a Command (no I/O)
+    commands.rs
+    commands/
+      interactive.rs   `diffkit [--no-watch] [PATH]` → tui::terminal::run
+      inspect.rs       `diffkit inspect`: the text report
+      diff_stats.rs    `diffkit diff-stats [--load]`
+      show.rs          `diffkit show <COMMIT>`
+  git.rs, git/         repository inspection through Git subprocesses
+    commands.rs        the only place a process is started
+    paths.rs           Git path bytes ↔ native paths
+    errors.rs          GitError and Result
+    repository.rs      repository discovery
+    status.rs          porcelain v2 reading and byte-level parsing
+    branches.rs        branch, HEAD, and upstream resolution
+    commits.rs         ahead/behind tracking
+    snapshot.rs        assembles one RepositorySnapshot
+    state.rs           operations in progress, from Git's state files
+    history.rs         recent commits, commit metadata, revision resolution
+  diff.rs, diff/       the diff engine
+    engine.rs          DiffEngine: discover / load_file_diff / load_each / load_all
+    commands.rs        argument arrays for diff-index, diff-files, diff-tree, …
+    discovery.rs       --raw --numstat -z parsing and DiffFile construction
+    parser.rs          byte-oriented unified diff parser
+    hunk.rs            line numbering, line endings, hunk validation
+    alignment.rs       Myers (linear space, bounded) + line pairing → AlignedRow
+    binary.rs          binary heuristic, blob sizes
+    untracked.rs       safe discovery and reading of untracked files (crate-private)
+    errors.rs          DiffError
+  sync.rs, sync/       watcher, classifier, debounce, reconcile, scheduler, diff cache
+  tui.rs, tui/         terminal interface (Ratatui + Crossterm)
+    app.rs             App state and updates; the only TUI code that calls the engines
+    actions.rs, keymap.rs, diff_view.rs, layout.rs
+    terminal.rs        terminal guard, panic hook, signals, loader thread, event loop
+    ui.rs, ui/         rendering: header, sidebar, diff_panel, history, status, overlays, theme
+  types.rs, types/     data shared between features
+    repository.rs      RepositorySnapshot and everything in it (from git)
+    diff.rs            DiffFile, FileDiff, rows, options (from diff)
+  helpers.rs, helpers/ pure utilities shared between features
+    display.rs         escaping, path quoting, content sanitizing, width, truncation
+    git_text.rs        Git's line terminator and C-quoted strings
+
+tests/                 every automated test; one target per feature
+  support/mod.rs       shared fixtures (temporary repositories, TUI rendering)
+  git.rs + git/        diff.rs + diff/    sync.rs + sync/    tui.rs + tui/
+  cli.rs + cli/        types.rs + types/  helpers.rs + helpers/
+  panic_hook.rs        separate target: panic hooks are process-wide
 ```
+
+What goes where:
+
+- **`types`** holds data that more than one feature reads: the repository
+  model (produced by `git`, read by `diff`, `sync`, `tui`, `cli`) and the
+  diff model (produced by `diff`, read by `sync`, `tui`, `cli`). Types used
+  by one feature stay in it, for example `DiffCollection` in
+  `diff::engine`, `ChangeSet` in `sync::events`, and `App` state in
+  `tui::app`. Error types stay with the module whose operations fail
+  (`git::errors`, `diff::errors`).
+- **`helpers`** holds pure, synchronous functions used by several features
+  that know nothing about a feature's types. Git path conversion stays in
+  `git::paths` because it reports `GitError`.
+- **Dependencies point one way:** `helpers` ← `types` ← `git` ← `diff` ←
+  `sync` ← `tui` ← `cli`. `helpers` and `types` depend on no feature.
+- **One path per item:** feature modules do not re-export their children's
+  items, so each item is imported from the module that defines it.
 
 ## Layers and responsibilities
 
 | Layer | Module | Responsibility |
 |---|---|---|
-| CLI | `app::cli` | Reads arguments, chooses the command, prints the report or the error, returns exit codes (0 ok, 1 inspection failed, 2 usage error). Contains no Git logic. |
-| Presentation | `app::report` | Turns a snapshot into text. Escapes ambiguous paths for display only. |
-| Git command | `git::commands` | Runs `git -C <dir> <args…>` with `std::process::Command`, discrete `OsStr` arguments, closed stdin, `GIT_OPTIONAL_LOCKS=0`, `GIT_NO_LAZY_FETCH=1`. Maps spawn failures to `GitNotFound` / `GitNotExecutable` / `Io`, non-zero exits to `CommandFailed` with stderr. Converts Git path bytes to native paths. |
+| CLI | `cli`, `cli::args` | Parses arguments into a `Command`, runs it, prints the output or the error, returns exit codes (0 ok, 1 inspection failed, 2 usage error, 128+N after signal N). Contains no Git logic. |
+| Presentation | `cli::commands::inspect` | Turns a snapshot into text. Escapes ambiguous paths for display only (`helpers::display`). |
+| Git command | `git::commands` | Runs `git -C <dir> <args…>` with `std::process::Command`, discrete `OsStr` arguments, closed stdin, `GIT_OPTIONAL_LOCKS=0`, `GIT_NO_LAZY_FETCH=1`. Maps spawn failures to `GitNotFound` / `GitNotExecutable` / `Io`, non-zero exits to `CommandFailed` with stderr. Path conversion is in `git::paths`. |
 | Repository | `git::repository` | One `rev-parse` answering inside-work-tree, bare, shallow, Git dir, common dir, and toplevel. Classifies failures as not a repository, not a work tree, or a command failure. |
 | Status | `git::status` | One `git status --porcelain=v2 -z --branch --ahead-behind --untracked-files=all`. Parses NUL-terminated records as bytes into `FileStatus` values and keeps the `# branch.*` headers raw. |
 | Branch | `git::branches` | Interprets `branch.oid`/`branch.head` into `BranchInfo`; resolves the upstream (`UpstreamInfo`) using `branch.upstream`, `branch.ab`, and at most one `rev-parse`. |
 | Commit | `git::commits` | Interprets `branch.ab` into `CommitTrackingInfo`, or records why counts are unavailable. |
 | Snapshot | `git::snapshot` | Calls the layers in order and returns one `RepositorySnapshot`. |
-| Model | `git::models` | Plain data types and predicates; no I/O and no formatting. |
+| Model | `types::repository` | Plain data types and predicates; no I/O and no formatting. |
 
 ## Data flow for `diffkit inspect`
 
@@ -99,7 +133,7 @@ contract (see `ENGINEERING_RULES.md`).
 
 ## How models are shared
 
-`git::models` types are public and free of display logic. The CLI consumes
+`types::repository` types are public and free of display logic. The CLI consumes
 them through `RepositorySnapshot`; integration tests assert on them
 directly; later phases can call `git::snapshot::inspect` or the individual
 layers. Missing information is represented by `Option` or a dedicated enum
@@ -133,7 +167,7 @@ even with `GIT_OPTIONAL_LOCKS=0` (see `docs/phases/PHASE_2_DIFF_ENGINE.md`).
 ## Phase 3: terminal interface
 
 ```text
-main → app::cli::run
+main → cli::run
   []  or  [PATH]          tui::run(path)        needs a TTY; repository inspected before raw mode
   inspect / diff-stats    unchanged plain-text commands
 
@@ -150,7 +184,7 @@ tui::run
 The interface lives in the library (`src/tui/`), so integration tests drive
 `App` and render it through Ratatui's `TestBackend` without a terminal. The
 binary only routes arguments. `display_path` moved from the binary's
-`report.rs` to `src/display.rs` so the report and the interface share it;
+`report.rs` to `src/helpers/display.rs` so the report and the interface share it;
 `report.rs` re-exports it.
 
 ## Phase 4: synchronization

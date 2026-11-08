@@ -16,11 +16,10 @@
 
 use super::errors::{GitError, Result};
 use std::{
-    borrow::Cow,
     cell::Cell,
     ffi::OsStr,
     io::{self, Read},
-    path::{Path, PathBuf},
+    path::Path,
     process::{Command, ExitStatus, Stdio},
 };
 
@@ -173,121 +172,5 @@ pub(crate) fn failure<S: AsRef<OsStr>>(args: &[S], out: &GitOutput) -> GitError 
             .collect(),
         code: out.status.code(),
         stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
-    }
-}
-
-/// Removes exactly one trailing `\n` (Git's line terminator) without
-/// touching other whitespace, which may be part of a path.
-pub(crate) fn strip_newline(bytes: &[u8]) -> &[u8] {
-    bytes.strip_suffix(b"\n").unwrap_or(bytes)
-}
-
-/// Converts a path emitted by Git into a native path without loss.
-///
-/// On Unix, Git paths are arbitrary bytes and map directly onto `OsStr`.
-/// Git for Windows stores and prints paths as UTF-8 and converts them to
-/// UTF-16 itself, so on Windows the bytes are decoded strictly as UTF-8;
-/// anything else is reported as malformed rather than silently replaced.
-#[cfg(unix)]
-pub fn path_from_git(bytes: &[u8]) -> Result<PathBuf> {
-    use std::os::unix::ffi::OsStrExt;
-    Ok(PathBuf::from(OsStr::from_bytes(bytes)))
-}
-
-#[cfg(not(unix))]
-pub fn path_from_git(bytes: &[u8]) -> Result<PathBuf> {
-    std::str::from_utf8(bytes)
-        .map(PathBuf::from)
-        .map_err(|e| GitError::malformed("path is not valid UTF-8", e.to_string()))
-}
-
-/// The bytes Git uses for a native path: the inverse of [`path_from_git`].
-#[cfg(unix)]
-pub fn path_bytes(path: &Path) -> Cow<'_, [u8]> {
-    use std::os::unix::ffi::OsStrExt;
-    Cow::Borrowed(path.as_os_str().as_bytes())
-}
-
-/// The bytes Git uses for a native path: the inverse of [`path_from_git`].
-/// Paths produced by Diffkit are valid UTF-8 on Windows; any other path is
-/// converted with replacement and can never match a Git path.
-#[cfg(not(unix))]
-pub fn path_bytes(path: &Path) -> Cow<'_, [u8]> {
-    match path.to_string_lossy() {
-        Cow::Borrowed(s) => Cow::Borrowed(s.as_bytes()),
-        Cow::Owned(s) => Cow::Owned(s.into_bytes()),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn strip_newline_keeps_other_whitespace() {
-        assert_eq!(
-            strip_newline(b"dir with trailing space \n"),
-            b"dir with trailing space "
-        );
-        assert_eq!(strip_newline(b"a\n\n"), b"a\n");
-        assert_eq!(strip_newline(b"a"), b"a");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn unix_paths_keep_raw_bytes() {
-        use std::os::unix::ffi::OsStrExt;
-        let p = path_from_git(b"raw-\xff\xfe name\n").unwrap();
-        assert_eq!(p.as_os_str().as_bytes(), b"raw-\xff\xfe name\n");
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn windows_paths_decode_utf8_strictly() {
-        assert_eq!(
-            path_from_git("dir/caf\u{e9} \u{65e5}.txt".as_bytes()).unwrap(),
-            PathBuf::from("dir/caf\u{e9} \u{65e5}.txt")
-        );
-        assert!(path_from_git(b"raw-\xff").is_err());
-    }
-
-    #[test]
-    fn failing_command_reports_stderr_and_code() {
-        let dir = std::env::temp_dir();
-        let err = run(
-            &dir,
-            &["rev-parse", "--verify", "refs/diffkit/definitely-missing"],
-        )
-        .expect_err("rev-parse of a missing ref must fail");
-        match err {
-            GitError::CommandFailed { args, code, .. } => {
-                assert_eq!(args[0], "rev-parse");
-                assert!(code.is_some());
-            }
-            other => panic!("unexpected error: {other}"),
-        }
-    }
-
-    #[test]
-    fn limited_output_reports_overflow_instead_of_truncating() {
-        let dir = std::env::temp_dir();
-        match output_limited(&dir, &["--version"], 4).unwrap() {
-            LimitedOutput::Exceeded { limit } => assert_eq!(limit, 4),
-            LimitedOutput::Complete(_) => panic!("`git --version` is longer than 4 bytes"),
-        }
-        match output_limited(&dir, &["--version"], 1 << 20).unwrap() {
-            LimitedOutput::Complete(out) => {
-                assert!(out.status.success());
-                assert!(out.stdout.starts_with(b"git version"));
-            }
-            LimitedOutput::Exceeded { .. } => panic!("unexpected overflow"),
-        }
-    }
-
-    #[test]
-    fn invocations_are_counted_per_thread() {
-        let before = thread_invocations();
-        let _ = output(&std::env::temp_dir(), &["--version"]);
-        assert_eq!(thread_invocations(), before + 1);
     }
 }

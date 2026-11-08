@@ -2,7 +2,7 @@
 
 use super::theme;
 use crate::{
-    display::escape_text,
+    helpers::display::escape_text,
     tui::app::{App, StatusKind, SyncPhase},
 };
 use ratatui::{
@@ -74,7 +74,7 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
     let (text, style) = sync_indicator(app);
     if !text.is_empty() {
-        let w = (crate::display::width(&text) as u16 + 1).min(area.width);
+        let w = (crate::helpers::display::width(&text) as u16 + 1).min(area.width);
         let rect = Rect::new(area.right() - w, area.y, w, 1);
         frame.render_widget(
             Paragraph::new(Line::styled(text, style)).alignment(Alignment::Right),

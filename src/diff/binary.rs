@@ -1,12 +1,11 @@
 //! Binary classification and size metadata. Binary content is never decoded
 //! or placed in line models.
 
-use super::{
-    commands,
-    errors::Result,
-    models::{BinarySummary, DiffFile},
+use crate::{
+    diff::{commands, errors::Result},
+    types::diff::{BinarySummary, DiffFile},
 };
-use crate::git::{self, models::ObjectId};
+use crate::{git, types::repository::ObjectId};
 use std::path::Path;
 
 /// Git's heuristic (`buffer_is_binary`): a NUL byte within the first 8000
@@ -24,7 +23,7 @@ pub fn blob_size(root: &Path, oid: &ObjectId) -> Result<Option<u64>> {
         return Ok(None);
     }
     Ok(
-        std::str::from_utf8(git::commands::strip_newline(&out.stdout))
+        std::str::from_utf8(crate::helpers::git_text::strip_newline(&out.stdout))
             .ok()
             .and_then(|s| s.parse().ok()),
     )
@@ -52,25 +51,4 @@ pub fn summary(
         }
     };
     Ok(BinarySummary { old_size, new_size })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn nul_within_first_8000_bytes_is_binary() {
-        assert!(!looks_binary(b"plain text\n"));
-        assert!(looks_binary(b"a\0b"));
-        let mut late = vec![b'a'; SNIFF_BYTES];
-        late.push(0);
-        assert!(
-            !looks_binary(&late),
-            "Git only inspects the first 8000 bytes"
-        );
-        assert!(
-            !looks_binary(&[0xff, 0xfe, 0x80]),
-            "non-UTF-8 is not binary"
-        );
-    }
 }

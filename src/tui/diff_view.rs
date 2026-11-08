@@ -5,12 +5,14 @@
 //! each [`ViewRow::Line`] is exactly one `AlignedRow`.
 
 use crate::{
-    diff::{
-        BinarySummary, ConflictInfo, DiffContent, DiffFile, DiffLine, DiffRowKind, FileDiff,
-        LineEnding, SubmoduleChange,
+    helpers::display::{sanitize_content, Segment},
+    types::{
+        diff::{
+            BinarySummary, ConflictInfo, DiffContent, DiffFile, DiffLine, DiffRowKind, FileDiff,
+            LineEnding, SubmoduleChange,
+        },
+        repository::ObjectId,
     },
-    display::{sanitize_content, Segment},
-    git::models::ObjectId,
 };
 
 pub const TAB_WIDTH: usize = 4;
@@ -34,7 +36,7 @@ impl Cell {
         let segments = sanitize_content(&line.content, TAB_WIDTH);
         let mut width: usize = segments
             .iter()
-            .map(|s| crate::display::width(&s.text))
+            .map(|s| crate::helpers::display::width(&s.text))
             .sum();
         width += match line.ending {
             LineEnding::None => NO_NEWLINE_MARK.len(),
@@ -117,7 +119,8 @@ impl DiffView {
                 let mut bounded_alignment = false;
                 for (index, hunk) in hunks.into_iter().enumerate() {
                     hunk_starts.push(rows.len());
-                    bounded_alignment |= hunk.alignment == crate::diff::AlignmentQuality::Bounded;
+                    bounded_alignment |=
+                        hunk.alignment == crate::types::diff::AlignmentQuality::Bounded;
                     max_line = max_line
                         .max(hunk.old_start + hunk.old_count)
                         .max(hunk.new_start + hunk.new_count);

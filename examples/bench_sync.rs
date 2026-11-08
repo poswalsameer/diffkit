@@ -17,13 +17,14 @@
 //! Diffkit's.
 
 use diffkit::{
-    diff::{DiffComparison, DiffOptions},
     git::commands::thread_invocations,
     sync::{
-        reconcile, ChangeSet, GitReconciler, Reconciled, SyncConfig, SyncDiagnostics, SyncEvent,
-        SyncService, SyncUpdate,
+        events::{ChangeSet, SyncDiagnostics},
+        reconcile::{self, Reconciled},
+        scheduler::{GitReconciler, SyncConfig, SyncEvent, SyncService, SyncUpdate},
     },
-    tui::{Action, App},
+    tui::{actions::Action, app::App},
+    types::diff::{DiffComparison, DiffOptions},
 };
 use ratatui::layout::Rect;
 use std::{

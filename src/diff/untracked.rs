@@ -14,16 +14,18 @@
 //! - Files larger than the configured limit are reported as
 //!   [`DiffContent::TooLarge`] without being read.
 
-use super::{
-    binary, commands,
-    errors::{DiffError, Result, StaleReason},
-    hunk,
-    models::{
+use crate::git::{self, paths::path_from_git};
+use crate::{
+    diff::{
+        binary, commands,
+        errors::{DiffError, Result, StaleReason},
+        hunk,
+    },
+    types::diff::{
         BinaryStatus, BinarySummary, ContentSource, DiffComparison, DiffContent, DiffFile,
         FileChangeKind, FileDiff, FileId, FileMode, StampType, WorktreeStamp,
     },
 };
-use crate::git::{self, commands::path_from_git};
 use std::{
     fs, io,
     io::Read,
@@ -200,7 +202,7 @@ pub fn load(root: &Path, file: &DiffFile, max_bytes: u64) -> Result<FileDiff> {
                 path: full.clone(),
                 source,
             })?;
-            git::commands::path_bytes(&target).into_owned()
+            git::paths::path_bytes(&target).into_owned()
         }
         StampType::File => {
             if before.len > max_bytes {

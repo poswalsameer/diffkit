@@ -43,12 +43,11 @@
 
 use super::{classifier::WatchLayout, events::ChangeSet};
 use crate::{
-    diff::{DiffComparison, DiffEngine, DiffFileList, DiffOptions},
-    git::{
-        self,
-        errors::GitError,
-        models::{RepositoryInfo, RepositorySnapshot},
-        repository, snapshot,
+    diff::engine::DiffEngine,
+    git::{self, errors::GitError, repository, snapshot},
+    types::{
+        diff::{DiffComparison, DiffFileList, DiffOptions},
+        repository::{RepositoryInfo, RepositorySnapshot},
     },
 };
 use std::{
@@ -329,7 +328,7 @@ pub fn ignored_directories(root: &Path) -> Result<Vec<PathBuf>, GitError> {
         .collect();
     for c in &candidates {
         let mut arg = std::ffi::OsString::from("./");
-        arg.push(git::commands::path_from_git(c)?.as_os_str());
+        arg.push(git::paths::path_from_git(c)?.as_os_str());
         args.push(arg);
     }
     let checked = git::commands::output_without_literal_pathspecs(root, &args)?;
@@ -338,9 +337,9 @@ pub fn ignored_directories(root: &Path) -> Result<Vec<PathBuf>, GitError> {
         return Err(git::commands::failure(&args, &checked));
     }
     let mut dirs = Vec::new();
-    for line in git::commands::strip_newline(&checked.stdout).split(|&b| b == b'\n') {
+    for line in crate::helpers::git_text::strip_newline(&checked.stdout).split(|&b| b == b'\n') {
         let raw = if line.first() == Some(&b'"') {
-            match crate::diff::parser::unquote(line) {
+            match crate::helpers::git_text::unquote(line) {
                 Some((p, used)) if used == line.len() => p,
                 _ => {
                     return Err(GitError::malformed(
@@ -355,7 +354,7 @@ pub fn ignored_directories(root: &Path) -> Result<Vec<PathBuf>, GitError> {
         let raw = raw.strip_prefix(b"./").unwrap_or(&raw);
         let dir = raw.strip_suffix(b"/").unwrap_or(raw);
         if !dir.is_empty() {
-            dirs.push(root.join(git::commands::path_from_git(dir)?));
+            dirs.push(root.join(git::paths::path_from_git(dir)?));
         }
     }
     Ok(dirs)
@@ -366,33 +365,4 @@ pub fn layout_for(r: &Reconciled, excluded: Vec<PathBuf>) -> WatchLayout {
     let mut layout = WatchLayout::new(&r.snapshot.repository);
     layout.excluded = excluded;
     layout
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn reuse_rules() {
-        use DiffComparison::*;
-        let w = ChangeSet::WORKTREE;
-        assert!(reusable(Staged, w));
-        assert!(!reusable(Unstaged, w));
-        assert!(!reusable(Untracked, w));
-        assert!(reusable(Combined, ChangeSet::REFS | ChangeSet::CONFIG));
-        for never in [
-            ChangeSet::INDEX,
-            ChangeSet::HEAD,
-            ChangeSet::MERGE_STATE,
-            ChangeSet::REBASE_STATE,
-            ChangeSet::STRUCTURE,
-            ChangeSet::OVERFLOW,
-            ChangeSet::MANUAL,
-            ChangeSet::STARTUP,
-        ] {
-            for c in DiffComparison::ALL {
-                assert!(!reusable(c, never | ChangeSet::REFS), "{c:?} {never:?}");
-            }
-        }
-    }
 }

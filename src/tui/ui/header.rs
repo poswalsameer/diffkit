@@ -2,10 +2,12 @@
 
 use super::theme;
 use crate::{
-    diff::DiffComparison,
-    display::{display_path, escape_text},
-    git::models::{CommitTrackingInfo, HeadState, RepositoryKind, UpstreamInfo},
+    helpers::display::{display_path, escape_text},
     tui::app::App,
+    types::{
+        diff::DiffComparison,
+        repository::{CommitTrackingInfo, HeadState, RepositoryKind, UpstreamInfo},
+    },
 };
 use ratatui::{
     layout::Rect,

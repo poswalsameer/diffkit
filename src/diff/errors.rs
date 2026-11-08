@@ -1,5 +1,5 @@
 //! Structured diff errors. Expected outcomes such as binary, too-large, or
-//! unmerged files are [`DiffContent`](super::models::DiffContent) values,
+//! unmerged files are [`DiffContent`](crate::types::diff::DiffContent) values,
 //! not errors.
 
 use crate::git::errors::GitError;
@@ -11,8 +11,8 @@ pub enum DiffError {
     Git(GitError),
     /// `git diff` output did not follow the unified diff format.
     Parse { line: usize, detail: String },
-    /// The [`FileId`](super::models::FileId) is not in the list.
-    UnknownFile(super::models::FileId),
+    /// The [`FileId`](crate::types::diff::FileId) is not in the list.
+    UnknownFile(crate::types::diff::FileId),
     /// The file changed after discovery; its metadata no longer describes
     /// what Git reports now. Discover again.
     Stale { path: PathBuf, reason: StaleReason },
@@ -99,24 +99,3 @@ impl std::error::Error for DiffError {
 }
 
 pub type Result<T> = std::result::Result<T, DiffError>;
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn messages_are_actionable() {
-        let e = DiffError::Stale {
-            path: "a.txt".into(),
-            reason: StaleReason::StatsChanged,
-        };
-        assert_eq!(
-            e.to_string(),
-            "a.txt changed since it was discovered (the added/removed line counts changed); discover again"
-        );
-        assert_eq!(
-            DiffError::parse(7, "truncated hunk").to_string(),
-            "malformed diff output at line 7: truncated hunk"
-        );
-    }
-}

@@ -39,11 +39,11 @@ sets:
 
 Diff commands also pass `--no-ext-diff --no-textconv --no-color`, so
 configured external diff programs and textconv filters never run
-(`tests/diff_read_only.rs` proves it with a positive control).
+(`tests/diff/read_only.rs` proves it with a positive control).
 
 Adding any other Git subcommand requires review, and the allow-lists in
-`tests/read_only.rs`, `tests/diff_read_only.rs`, `tests/history.rs`
-(`diffkit show`), and `tests/tui_cli.rs` (the running viewer) must be
+`tests/git/read_only.rs`, `tests/diff/read_only.rs`, `tests/git/history.rs`
+(`diffkit show`), and `tests/tui/terminal.rs` (the running viewer) must be
 updated deliberately.
 
 ## Git CLI is the source of truth
@@ -75,7 +75,7 @@ Two narrow exceptions, both in the per-worktree Git directory that
 - Arguments are passed individually as `OsStr`; nothing is concatenated into
   a command line. Paths are passed with `-C <dir>`.
 - No `sh`, `bash`, `cmd`, or PowerShell, no hooks, no external diff
-  programs, no aliases. `tests/read_only.rs` enforces the spawn rule.
+  programs, no aliases. `tests/git/read_only.rs` enforces the spawn rule.
 
 Known residual: `git status` honours the user's configuration. If
 `core.fsmonitor` names a hook script, Git runs it, exactly as it would for
@@ -140,7 +140,10 @@ feature that needs it.
 
 ## Testing
 
-Every layer has unit tests. Behaviour is verified with integration tests
+Every test lives in `tests/`, one target per feature, and uses only the
+library's public interface; production files contain no `#[cfg(test)]`
+code. Pure logic is tested from byte fixtures. Behaviour is verified with
+integration tests
 against real Git in isolated temporary repositories, using local bare
 repositories for remote scenarios. Tests never use the network, the
 developer's Git configuration, or a real repository. Never weaken or delete
@@ -151,12 +154,20 @@ a test to make it pass. See `TESTING_STRATEGY.md`.
 The CLI contains no Git parsing; the Git layer contains no formatting. Models
 are plain data. New features extend the layer that owns the concern.
 
+Module layout (see `ARCHITECTURE.md`): `name.rs` declares a module and
+`name/` holds its children; no `mod.rs` in `src/`. Data read by several
+features goes in `types`, pure functions used by several features in
+`helpers`; anything used by one feature stays in it. `helpers` and `types`
+depend on no feature, and features do not re-export their children's
+items.
+
 ## Paths
 
 Paths stay as `PathBuf`/`OsStr` internally. On Unix, Git's bytes map
 directly to `OsStr`. On Windows, Git for Windows emits UTF-8, which is
 decoded strictly. Anything undecodable is an error, never a lossy
-substitution. Display escaping lives only in `app::report`.
+substitution. Display escaping lives in `helpers::display` and is applied
+where text is shown (the CLI commands and the TUI).
 
 ## Performance
 

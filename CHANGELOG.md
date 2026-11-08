@@ -77,6 +77,17 @@ Not tagged or published. Release readiness is tracked in
   `Reconciled::{retries, settled}` were added.
 - `GitError::UnknownRevision` was added.
 - `diff::commands::{discovery, patch}` take a `Range`.
+- **Module layout.** Shared data moved to `diffkit::types`
+  (`git::models` → `types::repository`, `diff::models` → `types::diff`)
+  and shared pure functions to `diffkit::helpers` (`display` →
+  `helpers::display`; `strip_newline` and `unquote` → `helpers::git_text`).
+  Git path conversion moved to `git::paths`. `LoadedFile` and
+  `DiffCollection` are in `diff::engine`. The command line moved into the
+  library as `diffkit::cli` (`cli::run`, `cli::args`,
+  `cli::commands::inspect`). The re-exports in `diff`, `sync`, and `tui`
+  were removed; import each item from its defining module (for example
+  `tui::app::App`, `sync::scheduler::SyncService`).
+- Every test now lives in `tests/`, grouped into one target per feature.
 
 ## 0.1.0 — development phases 1–4
 

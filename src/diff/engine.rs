@@ -17,25 +17,25 @@
 //! and [`DiffEngine::load_file_diff`] loads one of them. Commits never
 //! change, so those lists cannot go stale.
 
-use super::{
-    binary, commands, discovery,
-    errors::{DiffError, Result, StaleReason},
-    hunk,
-    models::{
-        BinaryStatus, ConflictInfo, ContentSource, DiffCollection, DiffComparison, DiffContent,
-        DiffFile, DiffFileList, DiffOptions, FileChangeKind, FileDiff, FileId, LineStats,
-        LoadedFile, SubmoduleChange, SubmoduleWorktree,
+use crate::{
+    diff::{
+        binary, commands, discovery,
+        errors::{DiffError, Result, StaleReason},
+        hunk,
+        parser::{self, FilePatch, Origin, PatchKind},
+        untracked,
     },
-    parser::{self, FilePatch, Origin, PatchKind},
-    untracked,
+    types::diff::{
+        BinaryStatus, ConflictInfo, ContentSource, DiffComparison, DiffContent, DiffFile,
+        DiffFileList, DiffOptions, FileChangeKind, FileDiff, FileId, LineStats, SubmoduleChange,
+        SubmoduleWorktree,
+    },
 };
-use crate::git::{
-    self,
-    commands::{path_bytes, LimitedOutput},
-    models::{
+use crate::{
+    git::{self, commands::LimitedOutput, paths::path_bytes, snapshot},
+    types::repository::{
         ConflictKind, ConflictStages, ObjectFormat, ObjectId, RepositorySnapshot, RepositoryStatus,
     },
-    snapshot,
 };
 use std::{
     collections::HashMap,
@@ -46,6 +46,24 @@ use std::{
 /// line; above it the whole tree is compared. Far below the smallest
 /// platform limit (32,767 UTF-16 units for a Windows command line).
 pub const MAX_PATHSPEC_BYTES: usize = 16 * 1024;
+
+/// Result of loading one file as part of [`DiffCollection`].
+#[derive(Debug)]
+pub struct LoadedFile {
+    pub id: FileId,
+    pub result: Result<FileDiff>,
+}
+
+/// Every file of a [`DiffFileList`], loaded with one Git invocation
+/// ([`DiffEngine::load_all`]).
+#[derive(Debug)]
+pub struct DiffCollection {
+    pub comparison: DiffComparison,
+    pub files: Vec<LoadedFile>,
+    /// Paths Git reported at load time that were not in the discovered list
+    /// (the repository changed after discovery).
+    pub unexpected_paths: Vec<PathBuf>,
+}
 
 #[derive(Debug, Clone)]
 pub struct DiffEngine {
@@ -388,7 +406,7 @@ impl DiffEngine {
         let mut unexpected_paths = Vec::new();
         for s in sections.into_iter().flatten() {
             if let Some(p) = s.new_path.or(s.old_path) {
-                unexpected_paths.push(git::commands::path_from_git(&p)?);
+                unexpected_paths.push(git::paths::path_from_git(&p)?);
             }
         }
         Ok(unexpected_paths)
@@ -578,8 +596,8 @@ fn submodule_change(file: &DiffFile, sections: &[FilePatch]) -> SubmoduleChange 
 
 fn type_change_hunk(
     sections: Vec<FilePatch>,
-    opts: &super::models::AlignmentOptions,
-) -> Result<Option<super::models::DiffHunk>> {
+    opts: &crate::types::diff::AlignmentOptions,
+) -> Result<Option<crate::types::diff::DiffHunk>> {
     let mut old_lines = Vec::new();
     let mut new_lines = Vec::new();
     for s in sections {
@@ -606,7 +624,7 @@ fn type_change_hunk(
     .into_bytes();
     let (old_count, new_count) = (old_lines.len(), new_lines.len());
     let (rows, alignment) = super::alignment::align(old_lines, new_lines, opts);
-    Ok(Some(super::models::DiffHunk {
+    Ok(Some(crate::types::diff::DiffHunk {
         old_start: usize::from(old_count > 0),
         old_count,
         new_start: usize::from(new_count > 0),

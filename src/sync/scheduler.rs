@@ -21,7 +21,7 @@ use super::{
     reconcile::{self, Reconciled},
     watcher::{self, FsWatcher},
 };
-use crate::{diff::DiffOptions, git::commands::thread_invocations};
+use crate::{git::commands::thread_invocations, types::diff::DiffOptions};
 use std::{
     path::PathBuf,
     sync::{

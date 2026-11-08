@@ -15,8 +15,9 @@
 //! The commands run one after another, so a concurrent Git operation can
 //! land between them; the snapshot is consistent per command, not atomic.
 
-use super::{
-    branches, commits, errors::Result, models::RepositorySnapshot, repository, state, status,
+use crate::{
+    git::{branches, commits, errors::Result, repository, state, status},
+    types::repository::RepositorySnapshot,
 };
 use std::path::Path;
 
@@ -27,7 +28,7 @@ pub fn inspect(start: &Path) -> Result<RepositorySnapshot> {
 /// Like [`inspect`], for a repository already discovered with
 /// [`repository::discover_from`] (no second `rev-parse`).
 pub fn inspect_repository(
-    repository: crate::git::models::RepositoryInfo,
+    repository: crate::types::repository::RepositoryInfo,
 ) -> Result<RepositorySnapshot> {
     let report = status::read(&repository.root)?;
     let branch = branches::resolve(&repository.root, &report.headers)?;
@@ -53,7 +54,7 @@ pub fn inspect_repository(
 /// match `previous`; otherwise this falls back to [`inspect_repository`]
 /// (one more status call), so a wrong caller costs time, never correctness.
 pub fn inspect_repository_since(
-    repository: crate::git::models::RepositoryInfo,
+    repository: crate::types::repository::RepositoryInfo,
     previous: &RepositorySnapshot,
 ) -> Result<RepositorySnapshot> {
     let report = status::read_without_ahead_behind(&repository.root)?;

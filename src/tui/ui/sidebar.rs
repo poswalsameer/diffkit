@@ -3,10 +3,10 @@
 
 use super::theme;
 use crate::{
-    diff::{BinaryStatus, DiffFile, FileChangeKind},
-    display::{display_path, truncate_start, width},
+    helpers::display::{display_path, truncate_start, width},
     sync::reconcile::ListResult,
     tui::{app::App, layout},
+    types::diff::{BinaryStatus, DiffFile, FileChangeKind},
 };
 use ratatui::{
     layout::Rect,
@@ -45,7 +45,7 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
         Some(c) => Files {
             title: format!(
                 " FILES IN {} ({}) ",
-                crate::display::escape_text(&c.commit.short_id),
+                crate::helpers::display::escape_text(&c.commit.short_id),
                 c.files().len()
             ),
             list: &c.list,
@@ -86,7 +86,7 @@ fn render_files(frame: &mut Frame, app: &App, area: Rect, view: Files) {
         Err(message) => {
             let mut lines = vec![
                 Line::styled("Could not list changes:", theme::error()),
-                Line::raw(crate::display::escape_text(message)),
+                Line::raw(crate::helpers::display::escape_text(message)),
             ];
             // A commit's files are fixed; only working-tree lists can
             // recover on refresh.

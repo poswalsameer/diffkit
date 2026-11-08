@@ -4,8 +4,8 @@
 
 use super::theme;
 use crate::{
-    display::{escape_text, truncate_end, width},
     git::history::CommitInfo,
+    helpers::display::{escape_text, truncate_end, width},
     tui::{app::App, layout},
 };
 use ratatui::{

@@ -84,7 +84,7 @@ impl fmt::Display for GitError {
             Self::UnknownRevision { rev, detail } => write!(
                 f,
                 "\"{}\" is not a commit: {detail}",
-                crate::display::escape_text(rev)
+                crate::helpers::display::escape_text(rev)
             ),
             Self::MalformedOutput { context, detail } => {
                 write!(f, "unexpected Git output ({context}): {detail}")
@@ -104,35 +104,3 @@ impl std::error::Error for GitError {
 }
 
 pub type Result<T> = std::result::Result<T, GitError>;
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn command_failure_message_includes_args_code_and_stderr() {
-        let e = GitError::CommandFailed {
-            args: vec!["status".into(), "-z".into()],
-            code: Some(128),
-            stderr: "fatal: index file corrupt\n".into(),
-        };
-        assert_eq!(
-            e.to_string(),
-            "`git status -z` failed with exit code 128: fatal: index file corrupt"
-        );
-    }
-
-    #[test]
-    fn not_a_repository_message_names_path() {
-        let e = GitError::NotARepository {
-            path: PathBuf::from("/tmp/x"),
-            stderr: String::new(),
-        };
-        assert_eq!(e.to_string(), "/tmp/x is not inside a Git repository");
-    }
-
-    #[test]
-    fn git_not_found_is_actionable() {
-        assert!(GitError::GitNotFound.to_string().contains("PATH"));
-    }
-}

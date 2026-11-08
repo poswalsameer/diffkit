@@ -15,10 +15,14 @@
 //! warm-up. Fixture setup runs writing Git commands; Diffkit does not.
 
 use diffkit::{
-    diff::DiffOptions,
     git::commands::thread_invocations,
-    sync::{reconcile, ChangeSet, GitReconciler, Reconciled, SyncConfig, SyncService, SyncUpdate},
-    tui::{ui, Action, App},
+    sync::{
+        events::ChangeSet,
+        reconcile::{self, Reconciled},
+        scheduler::{GitReconciler, SyncConfig, SyncService, SyncUpdate},
+    },
+    tui::{actions::Action, app::App, ui},
+    types::diff::DiffOptions,
 };
 use ratatui::{backend::TestBackend, layout::Rect, Terminal};
 use std::{
@@ -105,9 +109,9 @@ fn frame(term: &mut Terminal<TestBackend>, app: &App) -> f64 {
 /// A real watcher session that records published results.
 struct Watch {
     service: SyncService,
-    rx: Receiver<diffkit::sync::SyncEvent>,
+    rx: Receiver<diffkit::sync::scheduler::SyncEvent>,
     /// Diagnostics of the latest event received.
-    diag: std::cell::Cell<diffkit::sync::SyncDiagnostics>,
+    diag: std::cell::Cell<diffkit::sync::events::SyncDiagnostics>,
 }
 
 impl Watch {
@@ -136,7 +140,11 @@ impl Watch {
     fn until(
         &self,
         pred: impl Fn(&Reconciled) -> bool,
-    ) -> (Option<Reconciled>, Instant, diffkit::sync::SyncDiagnostics) {
+    ) -> (
+        Option<Reconciled>,
+        Instant,
+        diffkit::sync::events::SyncDiagnostics,
+    ) {
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
             let e = self
@@ -156,7 +164,7 @@ impl Watch {
 
     /// Drains until nothing arrives for 1.5 s; returns the latest
     /// diagnostics.
-    fn settle(&self) -> diffkit::sync::SyncDiagnostics {
+    fn settle(&self) -> diffkit::sync::events::SyncDiagnostics {
         while let Ok(e) = self.rx.recv_timeout(Duration::from_millis(1500)) {
             self.diag.set(e.diagnostics);
         }
@@ -366,7 +374,7 @@ fn main() {
         let (_, at, _) = w.until(|r| {
             matches!(
                 r.snapshot.commit_tracking,
-                diffkit::git::models::CommitTrackingInfo::Compared { behind, .. } if behind > 0
+                diffkit::types::repository::CommitTrackingInfo::Compared { behind, .. } if behind > 0
             )
         });
         if run > 0 {

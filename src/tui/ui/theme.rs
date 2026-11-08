@@ -4,7 +4,7 @@
 //! Meaning is never carried by color alone: rows also have `-`/`+`/`~`
 //! markers and files have status letters.
 
-use crate::diff::{DiffComparison, DiffFile, DiffRowKind, FileChangeKind};
+use crate::types::diff::{DiffComparison, DiffFile, DiffRowKind, FileChangeKind};
 use ratatui::style::{Color, Modifier, Style};
 
 pub fn plain() -> Style {

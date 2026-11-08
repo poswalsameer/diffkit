@@ -28,17 +28,22 @@ use super::{
 };
 use crate::{
     diff::{
-        DiffComparison, DiffEngine, DiffError, DiffFile, DiffFileList, DiffOptions, StaleReason,
+        engine::DiffEngine,
+        errors::{DiffError, StaleReason},
     },
     git::{
         errors::GitError,
         history::{self, CommitInfo, History},
-        models::{FileStatus, ObjectId, RepositorySnapshot},
     },
     sync::{
         cache::{same_version, CacheKey, CacheStats, DiffCache, DEFAULT_BUDGET_BYTES},
+        events::{ChangeSet, SyncDiagnostics},
         reconcile::{self, ListResult, Reconciled},
-        ChangeSet, SyncDiagnostics, SyncEvent, SyncUpdate,
+        scheduler::{SyncEvent, SyncUpdate},
+    },
+    types::{
+        diff::{DiffComparison, DiffFile, DiffFileList, DiffOptions},
+        repository::{FileStatus, ObjectId, RepositorySnapshot},
     },
 };
 use ratatui::layout::Rect;
@@ -314,7 +319,7 @@ fn short(message: &str) -> String {
         .chars()
         .map(|c| if c.is_control() { ' ' } else { c })
         .collect();
-    crate::display::truncate_end(one_line.trim(), 300)
+    crate::helpers::display::truncate_end(one_line.trim(), 300)
 }
 
 impl App {
@@ -1217,7 +1222,7 @@ impl App {
                     kind: StatusKind::Info,
                     text: format!(
                         "{} is no longer in {}",
-                        crate::display::display_path(&path),
+                        crate::helpers::display::display_path(&path),
                         super::ui::theme::mode_title(self.mode)
                     ),
                 });
@@ -1326,7 +1331,7 @@ fn failure(e: &DiffError) -> LoadFailure {
             kind: FailureKind::Stale,
             message: short(&format!(
                 "{} changed after the file list was loaded ({}). Press r to refresh.",
-                crate::display::display_path(path),
+                crate::helpers::display::display_path(path),
                 match reason {
                     StaleReason::MissingFromDiff => "Git no longer reports this change",
                     StaleReason::ObjectChanged => "the staged content changed",
@@ -1340,7 +1345,7 @@ fn failure(e: &DiffError) -> LoadFailure {
             kind: FailureKind::Vanished,
             message: short(&format!(
                 "{} no longer exists. Press r to refresh.",
-                crate::display::display_path(path)
+                crate::helpers::display::display_path(path)
             )),
         },
         other => LoadFailure {

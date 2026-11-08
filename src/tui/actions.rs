@@ -1,6 +1,6 @@
 //! User intentions, independent of keys and rendering.
 
-use crate::diff::DiffComparison;
+use crate::types::diff::DiffComparison;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {

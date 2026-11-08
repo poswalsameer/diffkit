@@ -2,7 +2,7 @@
 
 use super::theme;
 use crate::{
-    display::escape_text,
+    helpers::display::escape_text,
     tui::app::{App, Overlay},
 };
 use ratatui::{
