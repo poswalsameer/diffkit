@@ -23,7 +23,7 @@ use super::{
 use crate::git::{commands::path_from_git, models::ObjectId};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    path::{Path, PathBuf},
+    path::Path,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -185,7 +185,7 @@ pub fn build_files(
     records: Vec<(RawRecord, NumstatRecord)>,
     comparison: DiffComparison,
     root: &Path,
-    conflicted: &HashSet<PathBuf>,
+    conflicted: impl Fn(&Path) -> bool,
 ) -> Result<Vec<DiffFile>> {
     let unmerged: HashSet<Vec<u8>> = records
         .iter()
@@ -229,8 +229,7 @@ pub fn build_files(
             (Some(p), true) => untracked::stamp(&root.join(p)).ok(),
             _ => None,
         };
-        let is_conflicted =
-            unmerged_entry || new_path.as_ref().is_some_and(|p| conflicted.contains(p));
+        let is_conflicted = unmerged_entry || new_path.as_deref().is_some_and(&conflicted);
         files.push(DiffFile {
             id: FileId(files.len()),
             comparison,
@@ -333,7 +332,7 @@ mod tests {
             recs,
             DiffComparison::Staged,
             Path::new("/nonexistent"),
-            &HashSet::new(),
+            |_| false,
         )
         .unwrap();
         let kinds: Vec<_> = files.iter().map(|f| f.kind).collect();

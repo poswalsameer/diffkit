@@ -8,16 +8,19 @@
 //! never enabled, so the terminal's own text selection keeps working.
 //!
 //! Threads while the interface runs:
-//! - main: owns [`App`], renders, applies input and synchronization
-//!   results, and loads the selected diff;
+//! - main: owns [`App`], renders, and applies input, synchronization
+//!   results, and loaded diffs;
 //! - input: reads terminal events (checking a stop flag every 200 ms);
+//! - loader ([`Loader`]): runs one diff load at a time, so a slow load
+//!   never stops the interface from responding (it shows "Loading…");
 //! - sync worker ([`SyncService`]): watcher, debounce, reconciliation.
 //!
-//! Input and sync results arrive on one bounded channel, so the main thread
-//! sleeps until something happens; there is no polling or frame timer.
-//! On exit, the input thread is joined, the channel is dropped (so the
-//! worker cannot block sending), and the worker gets a bounded time to
-//! stop.
+//! Input, sync results, and loaded diffs arrive on one bounded channel, so
+//! the main thread sleeps until something happens; there is no polling or
+//! frame timer. On exit, the input thread is joined, the loader is told to
+//! stop and detached (it may be inside a long Git command; it ends when
+//! that returns), the channel is dropped (so neither the loader nor the
+//! worker can block sending), and the worker gets a bounded time to stop.
 //!
 //! On Unix, SIGTERM, SIGHUP, and SIGINT sent from outside (raw mode turns
 //! Ctrl+C into a key, so SIGINT only comes from `kill`) end the session the
@@ -25,7 +28,11 @@
 //! returns, so the terminal is restored. A second signal while that is in
 //! progress exits immediately.
 
-use super::{actions::Action, app::App, keymap, ui};
+use super::{
+    actions::Action,
+    app::{App, LoadJob, LoadResult},
+    keymap, ui,
+};
 use crate::sync::{GitReconciler, SyncConfig, SyncEvent, SyncService};
 use crossterm::{
     cursor,
@@ -40,7 +47,7 @@ use std::{
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc::{self, Receiver, SyncSender},
-        Arc, Once,
+        Arc, Condvar, Mutex, Once,
     },
     thread::JoinHandle,
     time::Duration,
@@ -64,6 +71,8 @@ enum LoopEvent {
     Input(Event),
     InputFailed(io::Error),
     Sync(Box<SyncEvent>),
+    /// A diff finished loading on the loader thread.
+    Loaded(Box<LoadResult>),
     /// A termination signal arrived.
     Signal(i32),
 }
@@ -197,11 +206,13 @@ pub fn run(start: &Path, options: RunOptions) -> Result<(), TuiError> {
     app.set_background_sync(true);
     let signals = Signals::register()?;
     let guard = TerminalGuard::enter()?;
+    let loader = Loader::start(tx.clone());
     let input = InputThread::start(tx, signals.received());
     let result = Terminal::new(CrosstermBackend::new(io::stdout()))
         .map_err(TuiError::from)
-        .and_then(|mut terminal| event_loop(&mut terminal, &mut app, &rx, &sync));
+        .and_then(|mut terminal| event_loop(&mut terminal, &mut app, &rx, &sync, &loader));
     input.stop();
+    loader.stop();
     drop(rx);
     sync.shutdown(Duration::from_secs(2));
     drop(guard);
@@ -268,15 +279,16 @@ fn event_loop<B: ratatui::backend::Backend>(
     app: &mut App,
     rx: &Receiver<LoopEvent>,
     sync: &SyncService,
+    loader: &Loader,
 ) -> Result<(), TuiError>
 where
     TuiError: From<B::Error>,
 {
     loop {
-        if app.is_loading() {
-            // Show "Loading…" before a potentially slow diff load.
-            terminal.draw(|f| ui::render(f, app))?;
-            app.load_pending();
+        // The diff on screen loads in the background; until it arrives the
+        // frame drawn next shows "Loading…" and input keeps working.
+        if let Some(job) = app.take_load() {
+            loader.submit(job);
         }
         terminal.draw(|f| ui::render(f, app))?;
         let Ok(first) = rx.recv() else { return Ok(()) };
@@ -295,7 +307,6 @@ where
         if app.take_refresh_request() {
             sync.request_refresh();
         }
-        app.load_pending();
     }
 }
 
@@ -303,6 +314,7 @@ fn handle_loop_event(app: &mut App, event: LoopEvent) -> Result<(), TuiError> {
     match event {
         LoopEvent::Input(e) => handle(app, e),
         LoopEvent::Sync(e) => app.apply_sync(*e),
+        LoopEvent::Loaded(r) => app.finish_load(*r),
         LoopEvent::InputFailed(e) => return Err(TuiError::Io(e)),
         LoopEvent::Signal(n) => return Err(TuiError::Signal(n)),
     }
@@ -348,6 +360,65 @@ impl InputThread {
     fn stop(self) {
         self.stop.store(true, Ordering::SeqCst);
         let _ = self.handle.join();
+    }
+}
+
+/// Runs diff loads on its own thread, one at a time. At most one job
+/// waits: a newer one replaces it (the selection moved on), so nothing
+/// piles up however fast the selection changes. Results go to the main
+/// loop's channel.
+struct Loader {
+    slot: Arc<(Mutex<LoaderSlot>, Condvar)>,
+}
+
+#[derive(Default)]
+struct LoaderSlot {
+    job: Option<LoadJob>,
+    stop: bool,
+}
+
+impl Loader {
+    fn start(tx: SyncSender<LoopEvent>) -> Self {
+        let slot = Arc::new((Mutex::new(LoaderSlot::default()), Condvar::new()));
+        let shared = Arc::clone(&slot);
+        std::thread::Builder::new()
+            .name("diffkit-loader".into())
+            .spawn(move || loop {
+                let job = {
+                    let (lock, ready) = &*shared;
+                    let mut s = lock.lock().unwrap_or_else(|e| e.into_inner());
+                    loop {
+                        if s.stop {
+                            return;
+                        }
+                        if let Some(job) = s.job.take() {
+                            break job;
+                        }
+                        s = ready.wait(s).unwrap_or_else(|e| e.into_inner());
+                    }
+                };
+                if tx.send(LoopEvent::Loaded(Box::new(job.run()))).is_err() {
+                    return;
+                }
+            })
+            .expect("spawn loader thread");
+        Self { slot }
+    }
+
+    fn submit(&self, job: LoadJob) {
+        let (lock, ready) = &*self.slot;
+        lock.lock().unwrap_or_else(|e| e.into_inner()).job = Some(job);
+        ready.notify_one();
+    }
+
+    /// Asks the thread to stop without waiting: a load in progress finishes
+    /// its Git command first, and its result is discarded.
+    fn stop(self) {
+        let (lock, ready) = &*self.slot;
+        let mut s = lock.lock().unwrap_or_else(|e| e.into_inner());
+        s.stop = true;
+        s.job = None;
+        ready.notify_one();
     }
 }
 

@@ -42,8 +42,25 @@ pub const STATUS_ARGS: [&str; 6] = [
     "--untracked-files=all",
 ];
 
+/// Like [`STATUS_ARGS`], without the ahead/behind walk (`branch.ab` is then
+/// `+? -?` unless the two commits are equal). Used when the counts from a
+/// previous snapshot are known to still hold.
+pub const STATUS_ARGS_NO_AHEAD_BEHIND: [&str; 6] = [
+    "status",
+    "--porcelain=v2",
+    "-z",
+    "--branch",
+    "--no-ahead-behind",
+    "--untracked-files=all",
+];
+
 pub fn read(root: &Path) -> Result<StatusReport> {
     parse(&commands::run(root, &STATUS_ARGS)?)
+}
+
+/// [`read`] without computing ahead/behind counts.
+pub fn read_without_ahead_behind(root: &Path) -> Result<StatusReport> {
+    parse(&commands::run(root, &STATUS_ARGS_NO_AHEAD_BEHIND)?)
 }
 
 pub fn parse(raw: &[u8]) -> Result<StatusReport> {

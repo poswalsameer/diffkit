@@ -332,8 +332,12 @@ fn main() {
             diff::parser::parse_patch(&patch).unwrap();
         });
         let parsed = diff::parser::parse_patch(&patch).unwrap();
+        // build_hunks consumes its input, so each run starts from a copy of
+        // the parsed hunks. Before it consumed them, it copied every line's
+        // text itself, so the column measures comparable work.
         let (build_ms, _, _) = measure(runs, || {
-            diff::hunk::build_hunks(&parsed[0].hunks, &DiffOptions::default().alignment).unwrap();
+            diff::hunk::build_hunks(parsed[0].hunks.clone(), &DiffOptions::default().alignment)
+                .unwrap();
         });
         let quality = loaded
             .hunks()

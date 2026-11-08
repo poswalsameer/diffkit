@@ -79,12 +79,23 @@ pub fn discover(root: &Path) -> Result<Vec<DiffFile>> {
             Err(DiffError::parse(0, "ls-files output is not NUL-terminated"))
         };
     };
+    from_git_paths(root, body.split(|&b| b == 0))
+}
+
+/// Builds untracked entries from paths Git listed, relative to the root:
+/// `ls-files --others` output, or the `?` records of a status taken with
+/// `--untracked-files=all` (the same list, from the same ignore rules).
+pub fn from_git_paths<B: AsRef<[u8]>>(
+    root: &Path,
+    paths: impl IntoIterator<Item = B>,
+) -> Result<Vec<DiffFile>> {
     let mut files = Vec::new();
-    for raw in body.split(|&b| b == 0) {
+    for raw in paths {
+        let raw = raw.as_ref();
         // Nested repositories are listed as "dir/".
         let raw = raw.strip_suffix(b"/").unwrap_or(raw);
         if raw.is_empty() {
-            return Err(DiffError::parse(0, "empty path in ls-files output"));
+            return Err(DiffError::parse(0, "empty untracked path from Git"));
         }
         let path = path_from_git(raw)?;
         let worktree_stamp = stamp(&root.join(&path)).ok();

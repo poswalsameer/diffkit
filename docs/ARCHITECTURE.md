@@ -199,3 +199,41 @@ main thread: App::apply_sync → App::apply_reconciled (one-step swap) → load_
   retries; unsettled results are withheld by the scheduler.
 - `tui::terminal` routes SIGTERM, SIGHUP, and SIGINT to the event loop
   (Unix, `signal-hook`), so they take the normal restore path.
+
+## Optimization pass (after Phase 5)
+
+Supersedes the loop and reconciliation lines in the Phase 3 and 4 sections
+above where they differ.
+
+```text
+reconcile(trigger, previous)
+  rev-parse                       skipped when the trigger is local (worktree, index,
+                                  HEAD, merge/rebase state): previous locations reused,
+                                  rediscovered once if Git then fails
+  StateMarker checked after the snapshot and after each list; an attempt stops as
+  soon as Git state moved, pauses 10 ms × attempt, and starts over (last attempt full)
+  status                          --no-ahead-behind on worktree/index/ignore triggers;
+                                  upstream and counts reused if HEAD, branch, and
+                                  upstream name are unchanged (else a full status)
+  DiffEngine::discover_reported   tracked lists: diff-index/diff-files -- <tracked paths
+                                  status reported>; none → no Git call; > 16 KiB of paths
+                                  → whole tree. Untracked list: status's `?` records.
+
+tui event loop
+  app.take_load() → Loader thread (one job running, at most one waiting; a newer
+  job replaces the waiting one) → LoadJob::run (Git + DiffView) → LoopEvent::Loaded
+  → app.finish_load (dropped if the file's metadata changed meanwhile; reloaded if
+  still on screen). App::load_pending runs the same three steps inline (tests).
+```
+
+- `Reconciled::snapshot` is an `Arc<RepositorySnapshot>`, so the worker
+  keeps its base result and the interface keeps its state without copying
+  every status entry.
+- `hunk::build_hunks` consumes the parsed hunks and moves line text instead
+  of copying it.
+- `DiffEngine::load_each` hands each loaded file to a callback in list
+  order and frees its patch text; `load_all` collects from it, and
+  `diffkit diff-stats --load` summarizes from it without keeping the diffs.
+- Line pairing computes each line's sorted bigrams once per change block
+  and skips pairs whose bigram counts alone cannot reach the threshold.
+- `DiffCache` keeps a recency index, so eviction does not scan entries.

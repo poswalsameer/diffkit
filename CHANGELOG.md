@@ -7,6 +7,21 @@ All notable changes to Diffkit. Versions follow semantic versioning.
 Not tagged or published. Release readiness is tracked in
 [docs/RELEASE_CHECKLIST.md](docs/RELEASE_CHECKLIST.md).
 
+### Performance
+
+- Refreshes ask Git only about the paths `git status` reported, build the
+  untracked list from status, reuse repository discovery and ahead/behind
+  counts when only files changed, and stop a refresh as soon as Git state
+  moves under it. Measured on 20,000 files: 76 → 44 ms per file-triggered
+  refresh, and 690 → 154 ms when many files have new timestamps but
+  unchanged content.
+- Diffs load on a background thread; the interface keeps responding and
+  shows "Loading…" during a slow load.
+- Line pairing for large replaced blocks is 2–4.6× faster.
+- `diffkit diff-stats --load` no longer keeps every diff in memory (peak
+  158 → 111 MiB on a 1,000-file change) and no longer searches the loaded
+  list for each file.
+
 ### Added
 
 - **Local history:** `L` lists the 200 most recent commits reachable from

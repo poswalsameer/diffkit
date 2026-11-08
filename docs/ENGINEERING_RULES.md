@@ -16,6 +16,10 @@ with `./`, so pathspec magic cannot apply. Phase 5 history inspection adds
 `log` (with `--no-show-signature --no-notes --no-mailmap --no-color` and an
 explicit format) and `diff-tree -r <parent> <commit>` (with the same
 `--no-ext-diff --no-textconv` options as the other diff commands).
+When a reconciliation is triggered only by working-tree, index, or ignore
+rule changes, `status` runs with `--no-ahead-behind` instead of
+`--ahead-behind` and the previous counts are reused (they are recomputed
+whenever HEAD, the branch, or the upstream name differs).
 User-supplied revisions go through `rev-parse --verify --end-of-options`,
 so a revision starting with `-` is never read as an option. Porcelain `git diff`
 is deliberately not used, because it rewrites `.git/index` after

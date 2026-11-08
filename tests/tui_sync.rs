@@ -374,3 +374,46 @@ fn the_interface_stays_responsive_during_reconciliation() {
     drop(gate_tx);
     assert!(service.shutdown(Duration::from_secs(2)));
 }
+
+#[test]
+fn a_load_finishing_after_its_file_changed_is_not_shown() {
+    let (_t, repo) = repo("tsync-late-load");
+    let mut app = tui_app(&repo.path, 120, 40);
+    app.apply(Action::SelectNextFile);
+    assert_eq!(selected(&app), "b.txt");
+    // The load starts (as on the loader thread), then b.txt changes and a
+    // reconciliation is applied before the load finishes.
+    let job = app.take_load().expect("b.txt is not cached");
+    assert!(app.take_load().is_none(), "taken once");
+    repo.write("b.txt", "rewritten while loading\n");
+    let r = reconcile::reconcile(
+        app.start_path(),
+        DiffOptions::default(),
+        ChangeSet::MANUAL,
+        None,
+    )
+    .unwrap();
+    app.apply_reconciled(r);
+    app.finish_load(job.run());
+    assert!(app.loaded().is_none(), "the older version is dropped");
+    assert!(app.is_loading());
+    app.load_pending();
+    let v = app.view().expect("reloaded");
+    assert_eq!((v.added, v.removed), (1, 40), "the current version");
+}
+
+#[test]
+fn a_finished_load_for_another_file_is_cached_without_moving_the_view() {
+    let (_t, repo) = repo("tsync-other-load");
+    let mut app = tui_app(&repo.path, 120, 40);
+    app.apply(Action::SelectNextFile);
+    let job = app.take_load().expect("b.txt is not cached");
+    app.apply(Action::SelectNextFile);
+    assert_eq!(selected(&app), "c.txt");
+    let cached = app.cached_entries();
+    app.finish_load(job.run());
+    assert_eq!(app.cached_entries(), cached + 1, "b.txt is cached");
+    assert!(app.loaded().is_none(), "c.txt is still pending");
+    app.load_pending();
+    assert!(screen_text(&app).contains("c.txt twenty"));
+}

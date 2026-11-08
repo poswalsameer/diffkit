@@ -85,11 +85,10 @@ fn startup_discovers_everything_but_loads_only_the_selected_file() {
     let before = thread_invocations();
     let mut app = App::open(&repo.path, ratatui::layout::Rect::new(0, 0, 120, 40)).unwrap();
     let opened = thread_invocations() - before;
-    // Snapshot (rev-parse + status) + 4 discoveries; no diff loaded yet.
-    assert_eq!(
-        opened, 6,
-        "rev-parse, status, staged, unstaged, combined, untracked"
-    );
+    // Snapshot (rev-parse + status) + 3 tracked discoveries limited to the
+    // paths status reported; the untracked list comes from status itself.
+    // No diff loaded yet.
+    assert_eq!(opened, 5, "rev-parse, status, staged, unstaged, combined");
     assert_eq!(app.cached_entries(), 0);
     assert!(app.is_loading());
     assert_eq!(app.mode(), DiffComparison::Unstaged);

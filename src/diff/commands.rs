@@ -86,6 +86,14 @@ pub fn discovery(comparison: DiffComparison, range: Range) -> Vec<OsString> {
     args
 }
 
+/// [`discovery`] limited to `paths` (literal pathspecs after `--`).
+pub fn discovery_of(comparison: DiffComparison, range: Range, paths: &[&Path]) -> Vec<OsString> {
+    let mut args = discovery(comparison, range);
+    args.push("--".into());
+    args.extend(paths.iter().map(|p| p.as_os_str().to_owned()));
+    args
+}
+
 /// Unified patch for the given paths (all changed paths if empty).
 pub fn patch(
     comparison: DiffComparison,

@@ -2,9 +2,12 @@
 //! calls the Git and diff engines; rendering reads this state only.
 //!
 //! Loading is lazy: changing the selection marks the diff as pending, and
-//! the event loop calls [`App::load_pending`] once queued input has been
-//! handled. Loaded diffs (and load failures) are kept in a byte-budgeted
-//! LRU cache ([`DiffCache`]) keyed by comparison and file identity.
+//! once queued input has been handled the event loop takes the pending load
+//! ([`App::take_load`]), runs it on a loader thread ([`LoadJob::run`]), and
+//! hands the result back ([`App::finish_load`]); the interface keeps
+//! responding meanwhile. [`App::load_pending`] does all three inline.
+//! Loaded diffs (and load failures) are kept in a byte-budgeted LRU cache
+//! ([`DiffCache`]) keyed by comparison and file identity.
 //!
 //! Repository state changes only through [`App::apply_reconciled`], which
 //! replaces the snapshot and all four file lists at once. It is used by
@@ -24,14 +27,16 @@ use super::{
     layout::{self, DEFAULT_SIDEBAR_WIDTH, MIN_SIDEBAR_WIDTH, SIDEBAR_STEP},
 };
 use crate::{
-    diff::{DiffComparison, DiffEngine, DiffError, DiffFile, DiffOptions, StaleReason},
+    diff::{
+        DiffComparison, DiffEngine, DiffError, DiffFile, DiffFileList, DiffOptions, StaleReason,
+    },
     git::{
         errors::GitError,
         history::{self, CommitInfo, History},
-        models::{FileStatus, RepositorySnapshot},
+        models::{FileStatus, ObjectId, RepositorySnapshot},
     },
     sync::{
-        cache::{CacheKey, CacheStats, DiffCache, DEFAULT_BUDGET_BYTES},
+        cache::{same_version, CacheKey, CacheStats, DiffCache, DEFAULT_BUDGET_BYTES},
         reconcile::{self, ListResult, Reconciled},
         ChangeSet, SyncDiagnostics, SyncEvent, SyncUpdate,
     },
@@ -107,6 +112,57 @@ pub struct LoadFailure {
 pub enum Loaded {
     View(Box<DiffView>),
     Failed(LoadFailure),
+}
+
+/// Which diff a [`LoadJob`] belongs to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LoadTarget {
+    Worktree,
+    /// A file of the commit opened on the history screen.
+    Commit(ObjectId),
+}
+
+/// One diff to load, with everything loading needs, so it can run on
+/// another thread without the [`App`]. From [`App::take_load`].
+#[derive(Debug)]
+pub struct LoadJob {
+    target: LoadTarget,
+    engine: Arc<DiffEngine>,
+    list: Arc<DiffFileList>,
+    file: DiffFile,
+}
+
+impl LoadJob {
+    /// Runs Git and prepares the display rows: the slow part of loading.
+    pub fn run(self) -> LoadResult {
+        let loaded = match self.engine.load_file_diff(&self.list, self.file.id) {
+            Ok(diff) => Loaded::View(Box::new(DiffView::new(diff))),
+            Err(e) => Loaded::Failed(failure(&e)),
+        };
+        LoadResult {
+            target: self.target,
+            file: self.file,
+            loaded,
+        }
+    }
+}
+
+/// A finished [`LoadJob`], for [`App::finish_load`].
+#[derive(Debug)]
+pub struct LoadResult {
+    target: LoadTarget,
+    /// The metadata the diff was loaded for.
+    file: DiffFile,
+    loaded: Loaded,
+}
+
+impl LoadResult {
+    fn bytes(&self) -> usize {
+        match &self.loaded {
+            Loaded::View(v) => v.approx_bytes(),
+            Loaded::Failed(_) => FAILURE_BYTES,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -229,8 +285,9 @@ pub struct Status {
 pub struct App {
     start: PathBuf,
     options: DiffOptions,
-    engine: DiffEngine,
-    snapshot: RepositorySnapshot,
+    /// Shared with loads in flight.
+    engine: Arc<DiffEngine>,
+    snapshot: Arc<RepositorySnapshot>,
     mode: DiffComparison,
     modes: Vec<ModeState>,
     cache: DiffCache<Loaded>,
@@ -267,7 +324,7 @@ impl App {
     pub fn open(start: &Path, size: Rect) -> Result<Self, GitError> {
         let options = DiffOptions::default();
         let r = reconcile::reconcile(start, options, ChangeSet::STARTUP, None)?;
-        let engine = DiffEngine::from_snapshot(&r.snapshot, options);
+        let engine = Arc::new(DiffEngine::from_snapshot(&r.snapshot, options));
         let mut app = Self {
             start: start.to_path_buf(),
             options,
@@ -530,9 +587,9 @@ impl App {
         self.load_pending();
     }
 
-    /// Applies an action without loading. Never runs Git, except for
-    /// [`Action::Refresh`] and [`Action::OpenSelected`], which load on
-    /// purpose.
+    /// Applies an action without loading diffs (`Enter` marks the diff for
+    /// reloading). Runs Git only for [`Action::Refresh`] without background
+    /// synchronization, and to list history or a commit's files.
     pub fn apply(&mut self, action: Action) {
         match action {
             Action::Quit => self.quit = true,
@@ -803,35 +860,32 @@ impl App {
         }
     }
 
-    /// Loads the opened commit's selected file if it is not cached.
-    fn load_commit_pending(&mut self) {
-        let engine = &self.engine;
-        let Some(c) = self.history.as_mut().and_then(|h| h.open.as_mut()) else {
-            return;
-        };
+    /// The pending load of the opened commit's selected file, unless it is
+    /// cached. Never runs Git.
+    fn take_commit_load(&mut self) -> Option<LoadJob> {
+        let c = self.history.as_mut()?.open.as_mut()?;
         if !std::mem::take(&mut c.pending) {
-            return;
+            return None;
         }
-        let (Ok(list), selected) = (&c.list, c.selected) else {
-            return;
-        };
-        let Some(file) = list.files.get(selected) else {
-            return;
-        };
+        let Ok(list) = &c.list else { return None };
+        let file = list.files.get(c.selected)?;
         let key = CacheKey::of(file);
         c.cache.protect(Some(key.clone()));
         if c.cache.lookup(&key).is_none() {
-            let version = file.clone();
-            let loaded = match engine.load_file_diff(list, file.id) {
-                Ok(diff) => Loaded::View(Box::new(DiffView::new(diff))),
-                Err(e) => Loaded::Failed(failure(&e)),
-            };
-            let bytes = match &loaded {
-                Loaded::View(v) => v.approx_bytes(),
-                Loaded::Failed(_) => FAILURE_BYTES,
-            };
-            c.cache.insert(key, &version, loaded, bytes);
+            return Some(LoadJob {
+                target: LoadTarget::Commit(c.commit.id.clone()),
+                engine: Arc::clone(&self.engine),
+                list: Arc::clone(list),
+                file: file.clone(),
+            });
         }
+        self.settle_scroll();
+        None
+    }
+
+    /// Clamps the scroll of the diff on screen and selects the hunk at its
+    /// top, once that diff is available.
+    fn settle_scroll(&mut self) {
         self.clamp_scroll();
         let top = self.scroll().top;
         let hunk = self.view().and_then(|v| v.hunk_at(top));
@@ -969,30 +1023,98 @@ impl App {
 
     // -------------------------------------------------------------- loading
 
-    /// Loads the diff on screen if it is not cached. The only place,
-    /// besides refresh and opening history, where the TUI runs Git.
+    /// Loads the diff on screen if it is not cached, inline:
+    /// [`App::take_load`], [`LoadJob::run`], [`App::finish_load`].
     pub fn load_pending(&mut self) {
+        if let Some(job) = self.take_load() {
+            let result = job.run();
+            self.finish_load(result);
+        }
+    }
+
+    /// Takes the pending load of the diff on screen. A cached diff is used
+    /// at once; otherwise the returned job must be run and its result given
+    /// to [`App::finish_load`]. Never runs Git. On the history screen the
+    /// working tree's pending load waits until the screen closes.
+    pub fn take_load(&mut self) -> Option<LoadJob> {
         if self.history.is_some() {
-            // The working tree's pending load waits until history closes.
-            return self.load_commit_pending();
+            return self.take_commit_load();
         }
-        if !self.pending_load {
-            return;
+        if !std::mem::take(&mut self.pending_load) {
+            return None;
         }
-        self.pending_load = false;
         let Some(file) = self.selected_file() else {
             self.cache.protect(None);
-            return;
+            return None;
         };
         let key = CacheKey::of(file);
         self.cache.protect(Some(key.clone()));
         if self.cache.lookup(&key).is_some() {
             self.clamp_scroll();
-            return;
+            return None;
         }
-        self.load_selected();
+        let mode = self.current_mode();
+        let Ok(list) = &mode.list else { return None };
+        Some(LoadJob {
+            target: LoadTarget::Worktree,
+            engine: Arc::clone(&self.engine),
+            list: Arc::clone(list),
+            file: list.files.get(mode.selected)?.clone(),
+        })
     }
 
+    /// Stores a finished load in the cache it belongs to. A working-tree
+    /// result is dropped if its file changed or left its list while it
+    /// loaded (it would show an older version); a file still on screen is
+    /// then loaded again. A commit result is dropped if another commit was
+    /// opened meanwhile.
+    pub fn finish_load(&mut self, result: LoadResult) {
+        let key = CacheKey::of(&result.file);
+        let bytes = result.bytes();
+        match &result.target {
+            LoadTarget::Worktree => {
+                let selected = self.selected_file().is_some_and(|f| CacheKey::of(f) == key);
+                let current = match self.selected_file() {
+                    Some(f) if selected => Some(f),
+                    _ => self.modes[mode_index(result.file.comparison)]
+                        .files()
+                        .iter()
+                        .find(|f| CacheKey::of(f) == key),
+                };
+                if !current.is_some_and(|f| same_version(f, &result.file)) {
+                    self.pending_load |= selected;
+                    return;
+                }
+                let on_screen = selected && self.history.is_none();
+                if let (true, Loaded::Failed(f)) = (on_screen, &result.loaded) {
+                    self.status = Some(Status {
+                        kind: if f.kind == FailureKind::Other {
+                            StatusKind::Error
+                        } else {
+                            StatusKind::Warning
+                        },
+                        text: f.message.clone(),
+                    });
+                }
+                self.cache.insert(key, &result.file, result.loaded, bytes);
+                if on_screen {
+                    self.settle_scroll();
+                }
+            }
+            LoadTarget::Commit(id) => {
+                let Some(c) = self.commit_view_mut().filter(|c| &c.commit.id == id) else {
+                    return;
+                };
+                let on_screen = c.selected_file().is_some_and(|f| CacheKey::of(f) == key);
+                c.cache.insert(key, &result.file, result.loaded, bytes);
+                if on_screen {
+                    self.settle_scroll();
+                }
+            }
+        }
+    }
+
+    /// `Enter`: drops the cached diff on screen so it loads again.
     fn reload_selected(&mut self) {
         let Some(file) = self.selected_file() else {
             return;
@@ -1000,39 +1122,7 @@ impl App {
         let key = CacheKey::of(file);
         self.cache.remove(&key);
         self.cache.protect(Some(key));
-        self.load_selected();
-    }
-
-    fn load_selected(&mut self) {
-        let (Ok(list), selected) = (&self.current_mode().list, self.current_mode().selected) else {
-            return;
-        };
-        let Some(file) = list.files.get(selected) else {
-            return;
-        };
-        let key = CacheKey::of(file);
-        let version = file.clone();
-        let loaded = match self.engine.load_file_diff(list, file.id) {
-            Ok(diff) => Loaded::View(Box::new(DiffView::new(diff))),
-            Err(e) => Loaded::Failed(failure(&e)),
-        };
-        let bytes = match &loaded {
-            Loaded::View(v) => v.approx_bytes(),
-            Loaded::Failed(_) => FAILURE_BYTES,
-        };
-        if let Loaded::Failed(f) = &loaded {
-            self.status = Some(Status {
-                kind: if f.kind == FailureKind::Other {
-                    StatusKind::Error
-                } else {
-                    StatusKind::Warning
-                },
-                text: f.message.clone(),
-            });
-        }
-        self.cache.insert(key, &version, loaded, bytes);
-        self.clamp_scroll();
-        self.scroll.hunk = self.view().and_then(|v| v.hunk_at(self.scroll.top));
+        self.pending_load = true;
     }
 
     /// Manual refresh (`r`). With background synchronization the request is
@@ -1103,7 +1193,7 @@ impl App {
         let viewed = self
             .selected_file()
             .map(|f| (key_of(f), f.path().to_path_buf()));
-        self.engine = DiffEngine::from_snapshot(&r.snapshot, self.options);
+        self.engine = Arc::new(DiffEngine::from_snapshot(&r.snapshot, self.options));
         self.snapshot = r.snapshot;
         self.modes = modes_of(r.lists);
         for (m, (key, index)) in self.modes.iter_mut().zip(previous) {
